@@ -6,28 +6,30 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.media.MediaCodec
 import android.media.MediaCodec.BufferInfo
-import android.media.MediaDataSource
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.Bundle
-import android.os.Environment
+import android.os.Handler
+import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Log
+import android.view.Surface
 import android.view.SurfaceHolder
 import android.view.SurfaceView
-import android.view.Surface
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import java.nio.ByteBuffer
+import java.util.*
 
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
-    private val TAG = this::class.java.simpleName
     private var player: PlayerThread? = null
     private lateinit var surfaceView: SurfaceView
+    private lateinit var timer: Timer
+    private lateinit var handler: Handler
+    private lateinit var handlerThread: HandlerThread
 
     private val requestCodePermissions = 1
     private val permissions = arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE)
@@ -51,7 +53,10 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
-        surfaceView = findViewById<SurfaceView>(R.id.surfaceView)
+        surfaceView = findViewById(R.id.surfaceView)
+        handlerThread = HandlerThread("renderThread")
+        handlerThread.start()
+        handler = Handler(handlerThread.looper)
 
         if (allPermissionsGranted()) {
             surfaceView.holder.addCallback(this)
@@ -59,6 +64,39 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
             ActivityCompat.requestPermissions(this, permissions, requestCodePermissions)
         }
 
+//        // Monitor playing position while flip-flopping playback speed.
+//        timer = Timer()
+//        timer.schedule(object : TimerTask() {
+//            var lastPosMs = 0L
+//            var counter = 0
+//            override fun run() {
+//                player?.run {
+//                    val pos = currentPositionUs().div(1_000)
+//                    Log.d(TAG, "pos=${pos}ms (+${pos - lastPosMs}ms, x%.2f)".format(playbackSpeed))
+//                    lastPosMs = pos
+//                    if(counter%2==1){
+//                        playbackSpeed = playbackSpeed % 2 + 1
+//                    }
+//                    counter+=1
+//                }
+//            }
+//        }, 0, 1000)
+
+//        // seek to somewhere every second.
+//        timer = Timer()
+//        timer.schedule(object : TimerTask() {
+//            override fun run() {
+//                player?.run {
+//                }
+//            }
+//        }, 0, 1000)
+
+    }
+
+    override fun onPause() {
+        super.onPause()
+        Log.i(TAG, "Stop timer task.")
+        timer.cancel()
     }
 
     override fun surfaceCreated(holder: SurfaceHolder) {}
@@ -69,66 +107,66 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         width: Int,
         height: Int
     ) {
-        if (player == null) {
-            player = PlayerThread(holder.surface)
-            player!!.start()
-        }
+        player = PlayerThread(holder.surface)
+        player?.start()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
-        if (player != null) {
-            player!!.interrupt()
-        }
+        player?.interrupt()
     }
 
-    private inner class PlayerThread(surface: Surface) : Thread() {
+    private inner class PlayerThread(val surface: Surface) : Thread() {
 
-        private var extractor: MediaExtractor? = null
-        private var decoder: MediaCodec? = null
-        private val surface = surface
+        val bufferInfo = BufferInfo()
+        var playbackSpeed = 1.0
+        val extractor = MediaExtractor().apply {
+            val videoUri = findVideo(this@MainActivity)
+            Log.d(TAG, "video found: $videoUri")
+            setDataSource(this@MainActivity, videoUri, null)
+        }
+
+        fun currentPositionUs(): Long {
+            return bufferInfo.presentationTimeUs
+        }
+
+        fun seekTo(pos: Long) {
+        }
 
         override fun run() {
-            extractor = MediaExtractor().apply {
-                val videoUri = findVideo(this@MainActivity)
-                Log.d(TAG, "video found: $videoUri")
-                setDataSource(this@MainActivity, videoUri, null)
-            }
 
-            for (i in 0 until extractor!!.trackCount) {
-                val format = extractor!!.getTrackFormat(i)
-                val mime = format.getString(MediaFormat.KEY_MIME)
-                if (mime.startsWith("video/")) {
-                    extractor!!.selectTrack(i)
-                    decoder = MediaCodec.createDecoderByType(mime)
-                    decoder!!.configure(format, surface, null, 0)
-                    break
+            val decoder = extractor.run {
+                val (trackIdToformat, mime) = 0.until(trackCount).map { trackId ->
+                    val format = getTrackFormat(trackId)
+                    val mime = format.getString(MediaFormat.KEY_MIME)!!
+                    trackId to format to mime
+                }.find { (_, mime) ->
+                    mime.startsWith("video/")
+                }!!
+                val (trackId, format) = trackIdToformat
+                // Configure extractor with video track.
+                selectTrack(trackId)
+                MediaCodec.createDecoderByType(mime).apply {
+                    configure(format, surface, null, 0)
                 }
             }
 
-            if (decoder == null) {
-                Log.e("DecodeActivity", "Can't find video info!")
-                return
-            }
-
-            decoder!!.start()
-            val inputBuffers: Array<ByteBuffer> = decoder!!.inputBuffers
-            var outputBuffers: Array<ByteBuffer> = decoder!!.outputBuffers
-            val info = BufferInfo()
+            decoder.start()
             var isEOS = false
-            val startMs = System.currentTimeMillis()
+            val nowNs = { System.nanoTime() }
+            val startNs = nowNs()
 
-            while (!interrupted()) {
+            fun render() {
+                // Retrieve an encoded frame and send it to decoder.
                 if (!isEOS) {
-                    val inIndex = decoder!!.dequeueInputBuffer(10000)
-                    if (inIndex >= 0) {
-                        val buffer: ByteBuffer = inputBuffers[inIndex]
-                        val sampleSize = extractor!!.readSampleData(buffer, 0)
-                        if (sampleSize < 0) { // We shouldn't stop the playback at this point, just pass the EOS
-// flag to decoder, we will get it again from the
-// dequeueOutputBuffer
-                            Log.d("DecodeActivity", "InputBuffer BUFFER_FLAG_END_OF_STREAM")
-                            decoder!!.queueInputBuffer(
-                                inIndex,
+                    // Get ownership of input buffer.
+                    val inputBufferId = decoder.dequeueInputBuffer(10000)
+                    if (inputBufferId >= 0) {
+                        val inputBuffer = decoder.getInputBuffer(inputBufferId)!!
+                        val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                        if (sampleSize < 0) {
+                            Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM")
+                            decoder.queueInputBuffer(
+                                inputBufferId,
                                 0,
                                 0,
                                 0,
@@ -136,71 +174,57 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                             )
                             isEOS = true
                         } else {
-                            decoder!!.queueInputBuffer(
-                                inIndex,
+                            decoder.queueInputBuffer(
+                                inputBufferId,
                                 0,
                                 sampleSize,
-                                extractor!!.sampleTime,
+                                extractor.sampleTime,
                                 0
                             )
-                            extractor!!.advance()
+                            extractor.advance()
                         }
                     }
                 }
 
-                val outIndex = decoder!!.dequeueOutputBuffer(info, 10000)
-
-                when (outIndex) {
+                // Retrieve a decoded frame from decoder and render it on the surface.
+                val outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 10000)
+                when (outputBufferId) {
                     MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                        Log.d("DecodeActivity", "INFO_OUTPUT_BUFFERS_CHANGED")
-                        outputBuffers = decoder!!.outputBuffers
+                        Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
                     }
-                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> Log.d(
-                        "DecodeActivity",
-                        "New format " + decoder!!.outputFormat
-                    )
-                    MediaCodec.INFO_TRY_AGAIN_LATER -> Log.d(
-                        "DecodeActivity",
-                        "dequeueOutputBuffer timed out!"
-                    )
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        Log.d(TAG, "New format " + decoder.outputFormat)
+                    }
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        Log.d(TAG, "dequeueOutputBuffer timed out")
+                    }
                     else -> {
-                        val buffer: ByteBuffer = outputBuffers[outIndex]
-                        Log.v(
-                            "DecodeActivity",
-                            "We can't use this buffer but render it due to the API limit, $buffer"
-                        )
-
-                        // We use a very simple clock to keep the video FPS, or the video
-// playback will be too fast
-                        while (info.presentationTimeUs / 1000 > System.currentTimeMillis() - startMs) {
-                            try {
-                                sleep(10)
-                            } catch (e: InterruptedException) {
-                                e.printStackTrace()
-                                break
-                            }
-                        }
-
-                        decoder!!.releaseOutputBuffer(outIndex, true)
+                        // Send the output buffer to the surface.
+                        decoder.releaseOutputBuffer(outputBufferId, true)
                     }
                 }
 
-                // All decoded frames have been rendered, we can stop playing now
-                if (info.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                    Log.d("DecodeActivity", "OutputBuffer BUFFER_FLAG_END_OF_STREAM")
-                    break
+                if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
+                    // All decoded frames have been rendered, we can stop playing now
+                    Log.d(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM")
+                    decoder.stop()
+                    decoder.release()
+                    extractor.release()
+                } else {
+                    val elapsedNs = nowNs() - startNs
+                    val timeoutMs = (bufferInfo.presentationTimeUs * 1000 - elapsedNs) / 1000_000
+                    handler.postDelayed({ render() }, timeoutMs)
                 }
             }
 
-            decoder!!.stop()
-            decoder!!.release()
-            extractor!!.release()
+            handler.post { render() }
+
         }
 
     }
 
     /**
-     * Returns Uri of the largest video.
+     * Returns Uri of the shortest video.
      */
     fun findVideo(context: Context): Uri {
         val externalContentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
@@ -216,9 +240,13 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
                     cursor.getColumnIndex(MediaStore.Video.Media.SIZE).let { cursor.getLong(it) }
                 val uri = ContentUris.withAppendedId(externalContentUri, id)
                 uri to size
-            }.maxBy { it.second }!!.first
+            }.minBy { it.second }!!.first
         }!!
         return uri
+    }
+
+    companion object {
+        private val TAG = MainActivity::class.java.simpleName
     }
 
 }
