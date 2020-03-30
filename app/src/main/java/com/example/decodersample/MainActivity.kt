@@ -13,7 +13,6 @@ import android.view.SurfaceView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
-import kotlin.concurrent.thread
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
@@ -66,10 +65,6 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         val videoUri = findVideos(this).first()
         player = Player(this, holder.surface)
         player?.play(videoUri)
-        thread {
-            Thread.sleep(3000)
-            player!!.isPlaying()
-        }
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
