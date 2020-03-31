@@ -5,9 +5,9 @@ import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
-import kotlin.math.absoluteValue
 
 /**
  * Instrumented test, which will execute on an Android device.
@@ -16,8 +16,6 @@ import kotlin.math.absoluteValue
  */
 @RunWith(AndroidJUnit4::class)
 class PlayerTest {
-
-    fun approxEqual(a: Long, b: Long) = (a - b).absoluteValue < 300
 
     @Test
     fun useAppContext() {
@@ -31,11 +29,20 @@ class PlayerTest {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
             activity.player!!.also {
-                Thread.sleep(3000)
-                it.seekTo(10_000)
-                Log.i(TAG, "position=${it.currentPositionMs}")
-                assert(approxEqual(it.currentPositionMs, 10_000))
-                Thread.sleep(3000)
+                val delta = 100.0
+                Thread.sleep(2000)
+                // Seek forward.
+                it.seekTo(4000)
+                Thread.sleep(100)
+                assertEquals(4100.0, it.currentPositionMs.toDouble(), delta)
+                Thread.sleep(2000)
+                assertEquals(6100.0, it.currentPositionMs.toDouble(), delta)
+                // Seek backward.
+                it.seekTo(0)
+                Thread.sleep(100)
+                assertEquals(100.0, it.currentPositionMs.toDouble(), delta)
+                Thread.sleep(2000)
+                assertEquals(2100.0, it.currentPositionMs.toDouble(), delta)
             }
         }
     }
@@ -47,13 +54,39 @@ class PlayerTest {
             Thread.sleep(3000)
             val videoUris = activity.findVideos(activity.applicationContext)
             activity.player!!.also {
-                assert(it.isPlaying())
-                assert(it.videoUri == videoUris[0])
+                assertTrue(it.isInitializedWithVideo())
+                assertTrue(false)
                 // Change video and check player state.
                 it.play(videoUris[1])
                 Thread.sleep(3000)
-                assert(it.isPlaying())
-                assert(it.videoUri == videoUris[1])
+                assertTrue(it.isInitializedWithVideo())
+                assertTrue(it.videoUri == videoUris[1])
+            }
+        }
+    }
+
+    @Test
+    fun playToTheEndThenPause() {
+        val scenario = launchActivity<MainActivity>()
+        scenario.onActivity { activity ->
+            activity.player!!.also {
+                val delta = 100.0
+                val durationMs = it.durationMs!! / 1000
+                Log.d(TAG, "duration=$durationMs ms")
+                Thread.sleep(2000)
+                // Seek to the end and check player state.
+                it.seekTo(durationMs - 2000)
+                Thread.sleep(100)
+                assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
+                Thread.sleep(3000)
+                // Player should be pausing at the end.
+                assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
+                // Player should be playable after pause and seek.
+                it.seekTo(durationMs - 2000)
+                Thread.sleep(100)
+                assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
+                Thread.sleep(3000)
+                assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
             }
         }
     }

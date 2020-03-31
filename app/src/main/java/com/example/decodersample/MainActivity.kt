@@ -62,7 +62,8 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         height: Int
     ) {
         Log.i(TAG, "surface changed.")
-        val videoUri = findVideos(this).first()
+//        val videoUri = findVideos(this).first()
+        val videoUri = findVideos(this)[2]
         player = Player(this, holder.surface)
         player?.play(videoUri)
     }
