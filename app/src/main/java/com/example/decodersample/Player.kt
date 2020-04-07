@@ -27,10 +27,6 @@ class Player(private val context: Context, private val surface: Surface) {
      * The last position at which [playbackSpeed] is changed or start playback.
      */
     private var startingPositionUs = 0L
-        set(value) {
-            startingErtNs = ertNs
-            field = value
-        }
 
     /**
      * The last elapsed real-time at which [playbackSpeed] is changed or start playback.
@@ -41,20 +37,18 @@ class Player(private val context: Context, private val surface: Surface) {
         get() {
             val ertSinceStartUs = (ertNs - startingErtNs) / 1000
             val predictedPosition = startingPositionUs + (ertSinceStartUs * playbackSpeed).toLong()
-            return predictedPosition.coerceAtMost(durationUs!!)
+            return predictedPosition.coerceAtMost(durationUs)
         }
     val currentPositionMs: Long
-        get() = currentPositionUs / 1000
-    var videoUri: Uri? = null
+        get() {
+            checkIsPlaying()
+            return currentPositionUs / 1000
+        }
+    lateinit var videoUri: Uri
         private set
-    private var durationUs: Long? = null
-    val durationMs = durationUs?.div(1000)
-
-    /**
-     * Note: returns true even if playbackSpeed is 0.0.
-     */
-//    val isPlaying: Boolean
-//        get() = bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM == 0
+    private var durationUs: Long = 0L
+    val durationMs: Long
+        get() = durationUs.div(1000)
 
     // TODO: reverse-playback
     /**
@@ -62,12 +56,15 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     var playbackSpeed: Double = 1.0
         set(value) {
-            startingPositionUs = currentPositionUs
+            if (isPlaying()) {
+                startingPositionUs = currentPositionUs
+                startingErtNs = ertNs
+            }
             field = value
         }
 
-    private var decoder: MediaCodec? = null
-    private var extractor: MediaExtractor? = null
+    private lateinit var decoder: MediaCodec
+    private lateinit var extractor: MediaExtractor
     private val bufferInfo = MediaCodec.BufferInfo()
 
     /**
@@ -80,21 +77,34 @@ class Player(private val context: Context, private val surface: Surface) {
     }
     private val handler = Handler(handlerThread.looper)
 
+    /**
+     * Since [Player] doesn't have pause state, returns [true] even if playback speed is 0.0.
+     */
+    fun isPlaying(): Boolean {
+        return ::videoUri.isInitialized &&
+                ::decoder.isInitialized &&
+                ::extractor.isInitialized &&
+                handlerThread.isAlive
+    }
+
+    private fun checkIsPlaying() = check(isPlaying()) { "Player is not playing." }
+
     // TODO: exact seek
     /**
      * @param seekMode Default is [MediaExtractor.SEEK_TO_CLOSEST_SYNC]
      */
     fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_CLOSEST_SYNC) {
-        check(isInitializedWithVideo()) { "No video is set." }
+        checkIsPlaying()
         // Assumes that a `{ render() }` is queued.
         handler.removeCallbacks({ render() }, null)
         handler.post {
             Log.i(TAG, "Seek to $positionMs ms.")
             val positionUs = positionMs * 1000
-            extractor!!.seekTo(positionUs, seekMode)
+            extractor.seekTo(positionUs, seekMode)
             // Memorize requested position.
             startingPositionUs = positionUs
-            decoder!!.flush()
+            startingErtNs = ertNs
+            decoder.flush()
             if (isEOS) {
                 isEOS = false
                 handler.post { render() }
@@ -115,8 +125,8 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     fun play(videoUri: Uri) {
         Log.i(TAG, "Play video: $videoUri")
-        this.videoUri = videoUri
-        this.durationUs = videoUri.let {
+        // Retrieving duration may take some hundred ms.
+        durationUs = videoUri.let {
             val retriever = MediaMetadataRetriever().apply {
                 setDataSource(context, it)
             }
@@ -125,6 +135,9 @@ class Player(private val context: Context, private val surface: Surface) {
             retriever.release()
             durationMs.toLong() * 1000
         }
+        this.videoUri = videoUri
+        // Memorize elapsed real-time.
+        startingErtNs = ertNs
         handler.post(release)
         handler.post(initialize)
         handler.post { render() }
@@ -135,10 +148,13 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     private val release = Runnable {
         handler.removeCallbacks({ render() }, null)
-        Log.i(TAG, "Release decoder and extractor.")
-        decoder?.stop()
-        decoder?.release()
-        extractor?.release()
+        Log.i(TAG, "Release extractor and decoder.")
+        try {
+            decoder.stop()
+            decoder.release()
+            extractor.release()
+        } catch (e: UninitializedPropertyAccessException) {
+        }
     }
 
     /**
@@ -147,9 +163,9 @@ class Player(private val context: Context, private val surface: Surface) {
     private val initialize = Runnable {
         Log.i(TAG, "Initialize extractor and decoder.")
         extractor = MediaExtractor().apply {
-            setDataSource(context, videoUri!!, null)
+            setDataSource(context, videoUri, null)
         }
-        decoder = extractor!!.let {
+        decoder = extractor.let {
             val (trackIdToformat, mime) = 0.until(it.trackCount).map { trackId ->
                 val format = it.getTrackFormat(trackId)
                 val mime = format.getString(MediaFormat.KEY_MIME)!!
@@ -172,26 +188,24 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     private fun render() {
         // Retrieve an encoded frame and send it to decoder.
-        decoder!!.also { decoder ->
+        decoder.also { decoder ->
             if (isEOS) return@also
             // Get ownership of input buffer.
             val inputBufferId = decoder.dequeueInputBuffer(10000)
             // Return early if no input buffer available.
             if (inputBufferId < 0) return@also
             val inputBuffer = decoder.getInputBuffer(inputBufferId)!!
-            extractor!!.also { extractor ->
-                val sampleSize = extractor.readSampleData(inputBuffer, 0)
-                val (size, presentationTimeUs, flags) = if (sampleSize < 0) {
-                    Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM")
-                    isEOS = true
-                    Triple(0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
-                } else {
-                    Triple(sampleSize, extractor.sampleTime, 0)
-                }
-                decoder.queueInputBuffer(inputBufferId, 0, size, presentationTimeUs, flags)
-//                if (sampleSize >= 0) extractor.advance()
-                extractor.advance()
+            val sampleSize = extractor.readSampleData(inputBuffer, 0)
+            val (size, presentationTimeUs, flags) = if (sampleSize < 0) {
+                Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM")
+                isEOS = true
+                Triple(0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+            } else {
+                Triple(sampleSize, extractor.sampleTime, 0)
             }
+            decoder.queueInputBuffer(inputBufferId, 0, size, presentationTimeUs, flags)
+//                if (sampleSize >= 0) extractor.advance()
+            extractor.advance()
         }
 
         // Calculate the timeout for the next rendering. e.g.:
@@ -210,22 +224,20 @@ class Player(private val context: Context, private val surface: Surface) {
         val render = timeoutMs >= renderingThresholdMs
 
         // Retrieve a decoded frame and render it on the surface.
-        decoder!!.also { decoder ->
-            when (val outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 10000)) {
-                MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                    Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
-                }
-                MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                    Log.d(TAG, "New format " + decoder.outputFormat)
-                }
-                MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                    Log.d(TAG, "dequeueOutputBuffer timed out")
-                }
-                else -> {
-                    Log.d(TAG, "timeoutMs=$timeoutMs" + if (render) ", render" else "")
-                    // Send the output buffer to the surface while returning the buffer to the decoder.
-                    decoder.releaseOutputBuffer(outputBufferId, render)
-                }
+        when (val outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 10000)) {
+            MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
+                Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
+            }
+            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                Log.d(TAG, "New format " + decoder.outputFormat)
+            }
+            MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                Log.d(TAG, "dequeueOutputBuffer timed out")
+            }
+            else -> {
+                Log.d(TAG, "timeoutMs=$timeoutMs" + if (render) ", render" else "")
+                // Send the output buffer to the surface while returning the buffer to the decoder.
+                decoder.releaseOutputBuffer(outputBufferId, render)
             }
         }
 
@@ -237,10 +249,6 @@ class Player(private val context: Context, private val surface: Surface) {
             val timeout = if (render) timeoutMs else 0L
             handler.postDelayed({ render() }, timeout)
         }
-    }
-
-    fun isInitializedWithVideo(): Boolean {
-        return decoder != null && extractor != null && handlerThread.isAlive
     }
 
     companion object {

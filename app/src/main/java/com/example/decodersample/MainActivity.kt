@@ -1,12 +1,8 @@
 package com.example.decodersample
 
 import android.Manifest
-import android.content.ContentUris
-import android.content.Context
 import android.content.pm.PackageManager
-import android.net.Uri
 import android.os.Bundle
-import android.provider.MediaStore
 import android.util.Log
 import android.view.SurfaceHolder
 import android.view.SurfaceView
@@ -62,36 +58,12 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
         height: Int
     ) {
         Log.i(TAG, "surface changed.")
-//        val videoUri = findVideos(this).first()
-        val videoUri = findVideos(this)[2]
         player = Player(this, holder.surface)
-        player?.play(videoUri)
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.i(TAG, "surface destroyed.")
         player?.close()
-    }
-
-    /**
-     * Returns video uris sorted by size in descending order.
-     */
-    fun findVideos(context: Context): List<Uri> {
-        val externalContentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
-        val cursor = context.contentResolver.query(
-            externalContentUri, null, null, null, null
-        )
-        return cursor?.use { cursor ->
-            (1..cursor.count).mapNotNull {
-                cursor.moveToNext()
-                val id =
-                    cursor.getColumnIndex(MediaStore.Video.Media._ID).let { cursor.getLong(it) }
-                val size =
-                    cursor.getColumnIndex(MediaStore.Video.Media.SIZE).let { cursor.getLong(it) }
-                val uri = ContentUris.withAppendedId(externalContentUri, id)
-                uri to size
-            }.sortedBy { it.second /* size */ }.map { it.first /* uri */ }.reversed()
-        }!!
     }
 
     companion object {

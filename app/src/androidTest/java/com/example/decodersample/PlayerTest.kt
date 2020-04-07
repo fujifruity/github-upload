@@ -1,5 +1,9 @@
 package com.example.decodersample
 
+import android.content.ContentUris
+import android.content.Context
+import android.net.Uri
+import android.provider.MediaStore
 import android.util.Log
 import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -17,6 +21,27 @@ import org.junit.runner.RunWith
 @RunWith(AndroidJUnit4::class)
 class PlayerTest {
 
+    /**
+     * Returns video uris sorted by size in descending order.
+     */
+    fun findVideos(context: Context): List<Uri> {
+        val externalContentUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+        val cursor = context.contentResolver.query(
+            externalContentUri, null, null, null, null
+        )
+        return cursor?.use { cursor ->
+            (1..cursor.count).mapNotNull {
+                cursor.moveToNext()
+                val id =
+                    cursor.getColumnIndex(MediaStore.Video.Media._ID).let { cursor.getLong(it) }
+                val size =
+                    cursor.getColumnIndex(MediaStore.Video.Media.SIZE).let { cursor.getLong(it) }
+                val uri = ContentUris.withAppendedId(externalContentUri, id)
+                uri to size
+            }.sortedBy { it.second /* size */ }.map { it.first /* uri */ }.reversed()
+        }!!
+    }
+
     @Test
     fun useAppContext() {
         // Context of the app under test.
@@ -25,10 +50,28 @@ class PlayerTest {
     }
 
     @Test
+    fun justPlay() {
+        val scenario = launchActivity<MainActivity>()
+        scenario.onActivity { activity ->
+            activity.player!!.also {
+                val video = findVideos(activity.applicationContext)[0]
+                it.play(video)
+                it.playbackSpeed = 1.0
+                Thread.sleep(5000)
+                val delta = 100.0
+                assertEquals(5000.0, it.currentPositionMs.toDouble(), delta)
+                Log.i(TAG, "currentPosition=${it.currentPositionMs}")
+            }
+        }
+    }
+
+    @Test
     fun performSeek() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
             activity.player!!.also {
+                val video = findVideos(activity.applicationContext)[0]
+                it.play(video)
                 val delta = 100.0
                 Thread.sleep(2000)
                 // Seek forward.
@@ -51,16 +94,16 @@ class PlayerTest {
     fun changeVideoWhilePlaying() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            Thread.sleep(3000)
-            val videoUris = activity.findVideos(activity.applicationContext)
             activity.player!!.also {
-                assertTrue(it.isInitializedWithVideo())
-                assertTrue(false)
+                val videoUris = findVideos(activity.applicationContext)
+                it.play(videoUris[0])
+                Thread.sleep(2000)
+                assertEquals(it.videoUri, videoUris[0])
                 // Change video and check player state.
                 it.play(videoUris[1])
-                Thread.sleep(3000)
-                assertTrue(it.isInitializedWithVideo())
-                assertTrue(it.videoUri == videoUris[1])
+                Thread.sleep(2000)
+                assertTrue(it.isPlaying())
+                assertEquals(it.videoUri, videoUris[1])
             }
         }
     }
@@ -70,23 +113,49 @@ class PlayerTest {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
             activity.player!!.also {
-                val delta = 100.0
-                val durationMs = it.durationMs!! / 1000
-                Log.d(TAG, "duration=$durationMs ms")
+                val videoUris = findVideos(activity.applicationContext)
+                it.play(videoUris[1])
                 Thread.sleep(2000)
-                // Seek to the end and check player state.
-                it.seekTo(durationMs - 2000)
-                Thread.sleep(100)
-                assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
+                val seekAndPauseAtTheEnd = {
+                    val durationMs = it.durationMs
+                    val delta = 100.0
+                    // Seek to the end and check player's state.
+                    it.seekTo(durationMs - 2000)
+                    Thread.sleep(100)
+                    assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
+                    Thread.sleep(3000)
+                    // Player should be pausing at the end.
+                    assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
+                }
+                seekAndPauseAtTheEnd()
+                // Player should be playable after pausing at the end.
+                seekAndPauseAtTheEnd()
+            }
+        }
+    }
+
+    @Test
+    fun changePlaybackSpeed() {
+        val scenario = launchActivity<MainActivity>()
+        scenario.onActivity { activity ->
+            activity.player!!.also {
+                val video = findVideos(activity.applicationContext)[0]
+                it.play(video)
+                val delta = 100.0
+                it.playbackSpeed = 0.5
                 Thread.sleep(3000)
-                // Player should be pausing at the end.
-                assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
-                // Player should be playable after pause and seek.
-                it.seekTo(durationMs - 2000)
-                Thread.sleep(100)
-                assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 1.0
                 Thread.sleep(3000)
-                assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
+                assertEquals(4500.0, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 0.0
+                Thread.sleep(3000)
+                assertEquals(4500.0, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 10.0
+                Thread.sleep(3000)
+                assertEquals(34500.0, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 0.001
+                Thread.sleep(3000)
+                assertEquals(34503.0, it.currentPositionMs.toDouble(), delta)
             }
         }
     }
@@ -95,31 +164,4 @@ class PlayerTest {
         private val TAG = PlayerTest::class.java.simpleName
     }
 }
-
-//        // Monitor playing position while flip-flopping playback speed.
-//        timer = Timer()
-//        timer.schedule(object : TimerTask() {
-//            var lastPosMs = 0L
-//            var counter = 0
-//            override fun run() {
-//                player?.run {
-//                    val pos = currentPositionUs().div(1_000)
-//                    Log.d(TAG, "pos=${pos}ms (+${pos - lastPosMs}ms, x%.2f)".format(playbackSpeed))
-//                    lastPosMs = pos
-//                    if(counter%2==1){
-//                        playbackSpeed = playbackSpeed % 2 + 1
-//                    }
-//                    counter+=1
-//                }
-//            }
-//        }, 0, 1000)
-
-//        // seek to somewhere every second.
-//        timer = Timer()
-//        timer.schedule(object : TimerTask() {
-//            override fun run() {
-//                player?.run {
-//                }
-//            }
-//        }, 0, 1000)
 
