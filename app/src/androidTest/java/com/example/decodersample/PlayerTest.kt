@@ -4,7 +4,6 @@ import android.content.ContentUris
 import android.content.Context
 import android.net.Uri
 import android.provider.MediaStore
-import android.util.Log
 import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -54,13 +53,9 @@ class PlayerTest {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
             activity.player!!.also {
-                val video = findVideos(activity.applicationContext)[0]
+                val video = findVideos(activity.applicationContext)[1]
                 it.play(video)
-                it.playbackSpeed = 1.0
-                Thread.sleep(5000)
-                val delta = 100.0
-                assertEquals(5000.0, it.currentPositionMs.toDouble(), delta)
-                Log.i(TAG, "currentPosition=${it.currentPositionMs}")
+                Thread.sleep(3000)
             }
         }
     }
@@ -75,17 +70,13 @@ class PlayerTest {
                 val delta = 100.0
                 Thread.sleep(2000)
                 // Seek forward.
-                it.seekTo(4000)
-                Thread.sleep(100)
-                assertEquals(4100.0, it.currentPositionMs.toDouble(), delta)
+                it.seekTo(7000)
                 Thread.sleep(2000)
-                assertEquals(6100.0, it.currentPositionMs.toDouble(), delta)
+                assertEquals(9000.0, it.currentPositionMs.toDouble(), delta)
                 // Seek backward.
                 it.seekTo(0)
-                Thread.sleep(100)
-                assertEquals(100.0, it.currentPositionMs.toDouble(), delta)
                 Thread.sleep(2000)
-                assertEquals(2100.0, it.currentPositionMs.toDouble(), delta)
+                assertEquals(2000.0, it.currentPositionMs.toDouble(), delta)
             }
         }
     }

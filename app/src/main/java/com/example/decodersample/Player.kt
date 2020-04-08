@@ -20,8 +20,7 @@ class Player(private val context: Context, private val surface: Surface) {
     /**
      * Elapsed real-time since system boot.
      */
-    private val ertNs: Long
-        get() = System.nanoTime()
+    private fun ertNs() = System.nanoTime()
 
     /**
      * The last position at which [playbackSpeed] is changed or start playback.
@@ -31,17 +30,19 @@ class Player(private val context: Context, private val surface: Surface) {
     /**
      * The last elapsed real-time at which [playbackSpeed] is changed or start playback.
      */
-    private var startingErtNs = ertNs
+    private var startingErtNs = 0L
 
     private val currentPositionUs: Long
         get() {
-            val ertSinceStartUs = (ertNs - startingErtNs) / 1000
+            val ertSinceStartUs = (ertNs() - startingErtNs) / 1000
             val predictedPosition = startingPositionUs + (ertSinceStartUs * playbackSpeed).toLong()
             return predictedPosition.coerceAtMost(durationUs)
         }
+
+    // TODO: reflect buffer's presentation time
     val currentPositionMs: Long
         get() {
-            checkIsPlaying()
+            checkPlaying()
             return currentPositionUs / 1000
         }
     lateinit var videoUri: Uri
@@ -56,11 +57,16 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     var playbackSpeed: Double = 1.0
         set(value) {
-            if (isPlaying()) {
-                startingPositionUs = currentPositionUs
-                startingErtNs = ertNs
+            handler.post {
+                Log.i(TAG, "New playback speed: $value")
+                field = value
+                if (isPlaying()) {
+                    startingPositionUs = currentPositionUs
+                    startingErtNs = ertNs()
+                }
+                handler.removeCallbacks(render)
+                handler.post(render)
             }
-            field = value
         }
 
     private lateinit var decoder: MediaCodec
@@ -87,28 +93,25 @@ class Player(private val context: Context, private val surface: Surface) {
                 handlerThread.isAlive
     }
 
-    private fun checkIsPlaying() = check(isPlaying()) { "Player is not playing." }
+    private fun checkPlaying() = check(isPlaying()) { "Player is not playing." }
 
-    // TODO: exact seek
     /**
-     * @param seekMode Default is [MediaExtractor.SEEK_TO_CLOSEST_SYNC]
+     * @param seekMode Default is [MediaExtractor.SEEK_TO_NEXT_SYNC]
      */
-    fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_CLOSEST_SYNC) {
-        checkIsPlaying()
-        // Assumes that a `{ render() }` is queued.
-        handler.removeCallbacks({ render() }, null)
+    fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
+        // TODO: exact seek
+        checkPlaying()
         handler.post {
             Log.i(TAG, "Seek to $positionMs ms.")
             val positionUs = positionMs * 1000
             extractor.seekTo(positionUs, seekMode)
+            decoder.flush()
+            handler.removeCallbacks(render)
+            handler.post(render)
             // Memorize requested position.
             startingPositionUs = positionUs
-            startingErtNs = ertNs
-            decoder.flush()
-            if (isEOS) {
-                isEOS = false
-                handler.post { render() }
-            }
+            startingErtNs = ertNs()
+            isEOS = false
         }
     }
 
@@ -125,7 +128,7 @@ class Player(private val context: Context, private val surface: Surface) {
      */
     fun play(videoUri: Uri) {
         Log.i(TAG, "Play video: $videoUri")
-        // Retrieving duration may take some hundred ms.
+        // Retrieving duration may take some hundreds ms.
         durationUs = videoUri.let {
             val retriever = MediaMetadataRetriever().apply {
                 setDataSource(context, it)
@@ -137,23 +140,24 @@ class Player(private val context: Context, private val surface: Surface) {
         }
         this.videoUri = videoUri
         // Memorize elapsed real-time.
-        startingErtNs = ertNs
+        startingErtNs = ertNs()
         handler.post(release)
         handler.post(initialize)
-        handler.post { render() }
+        // If we post it directly, it won't be executed.
+//        handler.post(render)
+        handler.post { handler.post(render) }
     }
 
     /**
      * Free up resources used by decoder and extractor.
      */
     private val release = Runnable {
-        handler.removeCallbacks({ render() }, null)
+        handler.removeCallbacks(render)
         Log.i(TAG, "Release extractor and decoder.")
-        try {
+        if (isPlaying()) {
             decoder.stop()
             decoder.release()
             extractor.release()
-        } catch (e: UninitializedPropertyAccessException) {
         }
     }
 
@@ -166,14 +170,14 @@ class Player(private val context: Context, private val surface: Surface) {
             setDataSource(context, videoUri, null)
         }
         decoder = extractor.let {
-            val (trackIdToformat, mime) = 0.until(it.trackCount).map { trackId ->
+            val (trackIdToFormat, mime) = 0.until(it.trackCount).map { trackId ->
                 val format = it.getTrackFormat(trackId)
                 val mime = format.getString(MediaFormat.KEY_MIME)!!
                 Pair(trackId, format) to mime
             }.find { (_, mime) ->
                 mime.startsWith("video/")
             }!!
-            val (trackId, format) = trackIdToformat
+            val (trackId, format) = trackIdToFormat
             // Configure extractor with video track.
             it.selectTrack(trackId)
             MediaCodec.createDecoderByType(mime).apply {
@@ -186,68 +190,81 @@ class Player(private val context: Context, private val surface: Surface) {
     /**
      * Render a video frame by recursion. After rendering, this post itself to handler.
      */
-    private fun render() {
-        // Retrieve an encoded frame and send it to decoder.
-        decoder.also { decoder ->
-            if (isEOS) return@also
-            // Get ownership of input buffer.
-            val inputBufferId = decoder.dequeueInputBuffer(10000)
-            // Return early if no input buffer available.
-            if (inputBufferId < 0) return@also
-            val inputBuffer = decoder.getInputBuffer(inputBufferId)!!
-            val sampleSize = extractor.readSampleData(inputBuffer, 0)
-            val (size, presentationTimeUs, flags) = if (sampleSize < 0) {
-                Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM")
-                isEOS = true
-                Triple(0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+    private val render: Runnable = run {
+        Runnable {
+            // Retrieve an encoded frame and send it to decoder.
+            decoder.also { decoder ->
+                if (isEOS) return@also
+                // Get ownership of input buffer.
+                val inputBufferId = decoder.dequeueInputBuffer(10000)
+                // Return early if no input buffer available.
+                if (inputBufferId < 0) return@also
+                val inputBuffer = decoder.getInputBuffer(inputBufferId)!!
+                val sampleSize = extractor.readSampleData(inputBuffer, 0)
+                val (size, presentationTimeUs, flags) = if (sampleSize < 0) {
+                    Log.d(TAG, "InputBuffer BUFFER_FLAG_END_OF_STREAM")
+                    isEOS = true
+                    Triple(0, 0L, MediaCodec.BUFFER_FLAG_END_OF_STREAM)
+                } else {
+                    Triple(sampleSize, extractor.sampleTime, 0)
+                }
+                decoder.queueInputBuffer(inputBufferId, 0, size, presentationTimeUs, flags)
+                if (sampleSize >= 0) extractor.advance()
+//                extractor.advance()
+            }
+
+            // Calculate the timeout for the next rendering. e.g.:
+            //
+            //  .startingPosition  \\          .currentPosition    presentationTime
+            //     x1.0 | x2.0     //                  |                   |
+            // +-------------------\\-----------------------------------------> position
+            //          | <- 2.0 * ertSinceSpeedSet -> | <-2.0 * timeout-> |
+            //          |          \\                  |                   |
+            //
+            //    # .currentPosition :=  .startingPosition + 2.0 * ertSinceSpeedSet
+            //    # timeout := (presentationTime - .currentPosition) / 2.0
+
+            // Retrieve a decoded frame; render it on the surface; update buffer info.
+            val timeoutMs =
+                when (val outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 10000)) {
+                    MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
+                        Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
+                        0L
+                    }
+                    MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
+                        Log.d(TAG, "New format " + decoder.outputFormat)
+                        0L
+                    }
+                    MediaCodec.INFO_TRY_AGAIN_LATER -> {
+                        Log.d(TAG, "dequeueOutputBuffer timed out")
+                        0L
+                    }
+                    else -> {
+                        // Coerce the value because too large timeout value such as 9223372036854775807 is ignored by handler.postDelayed().
+                        // TODO: what if remove coercing
+                        // TODO: manage large negative value
+                        val timeoutMs =
+                            ((bufferInfo.presentationTimeUs - currentPositionUs) / (1000.0 * playbackSpeed))
+                                .toLong().coerceIn(0, 3_600_000)
+                        val renderingTimeoutThresholdMs = 20
+                        val isGoingToRender = timeoutMs >= renderingTimeoutThresholdMs
+                        // Send the output buffer to the surface while returning the buffer to the decoder.
+                        decoder.releaseOutputBuffer(outputBufferId, isGoingToRender)
+                        Log.d(
+                            TAG,
+                            "currentPos=${currentPositionMs}, presenMs=${bufferInfo.presentationTimeUs / 1000}, timeoutMs=$timeoutMs" + if (isGoingToRender) ", render" else ""
+                        )
+                        if (isGoingToRender) timeoutMs else 0L
+                    }
+                }
+
+            // Stop playing or continue.
+            if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0 && isEOS) {
+                Log.i(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM")
             } else {
-                Triple(sampleSize, extractor.sampleTime, 0)
+                // Call this method recursively.
+                handler.postDelayed(render, timeoutMs)
             }
-            decoder.queueInputBuffer(inputBufferId, 0, size, presentationTimeUs, flags)
-//                if (sampleSize >= 0) extractor.advance()
-            extractor.advance()
-        }
-
-        // Calculate the timeout for the next rendering. e.g.:
-        //
-        //  .startingPosition  \\          .currentPosition    presentationTime
-        //     x1.0 | x2.0     //                  |                   |
-        // +-------------------\\-----------------------------------------> position
-        //          | <- 2.0 * ertSinceSpeedSet -> | <-2.0 * timeout-> |
-        //          |          \\                  |                   |
-        //
-        //    # .currentPosition :=  .startingPosition + 2.0 * ertSinceSpeedSet
-        //    # timeout := (presentationTime - .currentPosition) / 2.0
-        val timeoutMs =
-            ((bufferInfo.presentationTimeUs - currentPositionUs) / (1000.0 * playbackSpeed)).toLong()
-        val renderingThresholdMs = 20
-        val render = timeoutMs >= renderingThresholdMs
-
-        // Retrieve a decoded frame and render it on the surface.
-        when (val outputBufferId = decoder.dequeueOutputBuffer(bufferInfo, 10000)) {
-            MediaCodec.INFO_OUTPUT_BUFFERS_CHANGED -> {
-                Log.d(TAG, "INFO_OUTPUT_BUFFERS_CHANGED")
-            }
-            MediaCodec.INFO_OUTPUT_FORMAT_CHANGED -> {
-                Log.d(TAG, "New format " + decoder.outputFormat)
-            }
-            MediaCodec.INFO_TRY_AGAIN_LATER -> {
-                Log.d(TAG, "dequeueOutputBuffer timed out")
-            }
-            else -> {
-                Log.d(TAG, "timeoutMs=$timeoutMs" + if (render) ", render" else "")
-                // Send the output buffer to the surface while returning the buffer to the decoder.
-                decoder.releaseOutputBuffer(outputBufferId, render)
-            }
-        }
-
-        // Stop playing or continue.
-        if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0 && isEOS) {
-            Log.i(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM")
-        } else {
-            // Call this method recursively.
-            val timeout = if (render) timeoutMs else 0L
-            handler.postDelayed({ render() }, timeout)
         }
     }
 
