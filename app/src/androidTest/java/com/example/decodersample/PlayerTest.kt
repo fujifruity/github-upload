@@ -74,9 +74,9 @@ class PlayerTest {
                 Thread.sleep(2000)
                 assertEquals(9000.0, it.currentPositionMs.toDouble(), delta)
                 // Seek backward.
-                it.seekTo(0)
+                it.seekTo(1000)
                 Thread.sleep(2000)
-                assertEquals(2000.0, it.currentPositionMs.toDouble(), delta)
+                assertEquals(3000.0, it.currentPositionMs.toDouble(), delta)
             }
         }
     }
@@ -88,11 +88,12 @@ class PlayerTest {
             activity.player!!.also {
                 val videoUris = findVideos(activity.applicationContext)
                 it.play(videoUris[0])
-                Thread.sleep(2000)
+                Thread.sleep(1000)
+                assertTrue(it.isPlaying())
                 assertEquals(it.videoUri, videoUris[0])
                 // Change video and check player state.
                 it.play(videoUris[1])
-                Thread.sleep(2000)
+                Thread.sleep(1000)
                 assertTrue(it.isPlaying())
                 assertEquals(it.videoUri, videoUris[1])
             }
@@ -105,18 +106,17 @@ class PlayerTest {
         scenario.onActivity { activity ->
             activity.player!!.also {
                 val videoUris = findVideos(activity.applicationContext)
+                val delta = 100.0
                 it.play(videoUris[1])
                 Thread.sleep(2000)
-                val seekAndPauseAtTheEnd = {
-                    val durationMs = it.durationMs
-                    val delta = 100.0
-                    // Seek to the end and check player's state.
-                    it.seekTo(durationMs - 2000)
-                    Thread.sleep(100)
-                    assertEquals(durationMs - 1900.0, it.currentPositionMs.toDouble(), delta)
-                    Thread.sleep(3000)
+                fun seekAndPauseAtTheEnd() {
+                    // Seek to the right before the end, then check player's state.
+                    it.seekTo(it.durationMs - 3000)
+                    Thread.sleep(2000)
+                    assertEquals(it.durationMs - 1000.0, it.currentPositionMs.toDouble(), delta)
+                    Thread.sleep(2000)
                     // Player should be pausing at the end.
-                    assertEquals(durationMs.toDouble(), it.currentPositionMs.toDouble(), delta)
+                    assertTrue(it.durationMs - 1000.0 < it.currentPositionMs.toDouble())
                 }
                 seekAndPauseAtTheEnd()
                 // Player should be playable after pausing at the end.
@@ -131,22 +131,24 @@ class PlayerTest {
         scenario.onActivity { activity ->
             activity.player!!.also {
                 val video = findVideos(activity.applicationContext)[0]
-                it.play(video)
                 val delta = 100.0
-                it.playbackSpeed = 0.5
+                var playedMs = 0.0
+                it.play(video)
                 Thread.sleep(3000)
-                it.playbackSpeed = 1.0
-                Thread.sleep(3000)
-                assertEquals(4500.0, it.currentPositionMs.toDouble(), delta)
+                playedMs += it.playbackSpeed * 3000.0
+                assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
                 it.playbackSpeed = 0.0
                 Thread.sleep(3000)
-                assertEquals(4500.0, it.currentPositionMs.toDouble(), delta)
-                it.playbackSpeed = 10.0
+                playedMs += it.playbackSpeed * 3000.0
+                assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 4.0
                 Thread.sleep(3000)
-                assertEquals(34500.0, it.currentPositionMs.toDouble(), delta)
-                it.playbackSpeed = 0.001
+                playedMs += it.playbackSpeed * 3000.0
+                assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
+                it.playbackSpeed = 0.1
                 Thread.sleep(3000)
-                assertEquals(34503.0, it.currentPositionMs.toDouble(), delta)
+                playedMs += it.playbackSpeed * 3000.0
+                assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
             }
         }
     }
