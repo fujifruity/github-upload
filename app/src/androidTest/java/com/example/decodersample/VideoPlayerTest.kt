@@ -6,7 +6,6 @@ import android.net.Uri
 import android.provider.MediaStore
 import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -18,7 +17,7 @@ import org.junit.runner.RunWith
  * See [testing documentation](http://d.android.com/tools/testing).
  */
 @RunWith(AndroidJUnit4::class)
-class PlayerTest {
+class VideoPlayerTest {
 
     /**
      * Returns video uris sorted by size in descending order.
@@ -41,21 +40,41 @@ class PlayerTest {
         }!!
     }
 
-    @Test
-    fun useAppContext() {
-        // Context of the app under test.
-        val appContext = InstrumentationRegistry.getInstrumentation().targetContext
-        assertEquals("com.example.decodersample", appContext.packageName)
-    }
+//    @Test
+//    fun useAppContext() {
+//        // Context of the app under test.
+//        val appContext = InstrumentationRegistry.getInstrumentation().targetContext
+//        assertEquals("com.example.decodersample", appContext.packageName)
+//    }
 
     @Test
     fun justPlay() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            activity.player!!.also {
-                val video = findVideos(activity.applicationContext)[1]
+            activity.videoPlayer!!.also {
+                val video = findVideos(activity.applicationContext)[0]
                 it.play(video)
-                Thread.sleep(3000)
+                Thread.sleep(1000)
+            }
+        }
+    }
+
+    @Test
+    fun doPause() {
+        val scenario = launchActivity<MainActivity>()
+        scenario.onActivity { activity ->
+            activity.videoPlayer!!.also {
+                val video = findVideos(activity.applicationContext)[0]
+                val delta = 0.0
+                it.play(video)
+                it.playbackSpeed = 2.0
+                Thread.sleep(2000)
+                it.togglePause()
+                Thread.sleep(2000)
+                assertEquals(it.playbackSpeed, 0.0, delta)
+                it.togglePause()
+                Thread.sleep(2000)
+                assertEquals(it.playbackSpeed, 2.0, delta)
             }
         }
     }
@@ -64,7 +83,7 @@ class PlayerTest {
     fun performSeek() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            activity.player!!.also {
+            activity.videoPlayer!!.also {
                 val video = findVideos(activity.applicationContext)[0]
                 it.play(video)
                 val delta = 100.0
@@ -85,15 +104,15 @@ class PlayerTest {
     fun changeVideoWhilePlaying() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            activity.player!!.also {
+            activity.videoPlayer!!.also {
                 val videoUris = findVideos(activity.applicationContext)
                 it.play(videoUris[0])
-                Thread.sleep(1000)
+                Thread.sleep(2000)
                 assertTrue(it.isPlaying())
                 assertEquals(it.videoUri, videoUris[0])
                 // Change video and check player state.
                 it.play(videoUris[1])
-                Thread.sleep(1000)
+                Thread.sleep(2000)
                 assertTrue(it.isPlaying())
                 assertEquals(it.videoUri, videoUris[1])
             }
@@ -104,12 +123,12 @@ class PlayerTest {
     fun playToTheEndThenPause() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            activity.player!!.also {
+            activity.videoPlayer!!.also {
                 val videoUris = findVideos(activity.applicationContext)
                 val delta = 100.0
                 it.play(videoUris[1])
                 Thread.sleep(2000)
-                fun seekAndPauseAtTheEnd() {
+                val seekAndPauseAtTheEnd = {
                     // Seek to the right before the end, then check player's state.
                     it.seekTo(it.durationMs - 3000)
                     Thread.sleep(2000)
@@ -129,7 +148,7 @@ class PlayerTest {
     fun changePlaybackSpeed() {
         val scenario = launchActivity<MainActivity>()
         scenario.onActivity { activity ->
-            activity.player!!.also {
+            activity.videoPlayer!!.also {
                 val video = findVideos(activity.applicationContext)[0]
                 val delta = 100.0
                 var playedMs = 0.0
@@ -137,11 +156,11 @@ class PlayerTest {
                 Thread.sleep(3000)
                 playedMs += it.playbackSpeed * 3000.0
                 assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
-                it.playbackSpeed = 0.0
+                it.playbackSpeed = 6.0
                 Thread.sleep(3000)
                 playedMs += it.playbackSpeed * 3000.0
                 assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
-                it.playbackSpeed = 4.0
+                it.playbackSpeed = 0.0
                 Thread.sleep(3000)
                 playedMs += it.playbackSpeed * 3000.0
                 assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
@@ -154,7 +173,7 @@ class PlayerTest {
     }
 
     companion object {
-        private val TAG = PlayerTest::class.java.simpleName
+        private val TAG = VideoPlayerTest::class.java.simpleName
     }
 }
 
