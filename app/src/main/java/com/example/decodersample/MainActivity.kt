@@ -9,10 +9,11 @@ import android.view.SurfaceView
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import com.example.videoplayer.VideoPlayer
 
 class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
-    var videoPlayer: VideoPlayer? = null
+    lateinit var videoPlayer: VideoPlayer
     private lateinit var surfaceView: SurfaceView
 
     private val requestCodePermissions = 1
@@ -63,7 +64,7 @@ class MainActivity : AppCompatActivity(), SurfaceHolder.Callback {
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         Log.i(TAG, "surface destroyed.")
-        videoPlayer?.close()
+        videoPlayer.close()
     }
 
     companion object {

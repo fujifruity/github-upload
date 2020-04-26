@@ -1,4 +1,4 @@
-package com.example.decodersample
+package com.example.videoplayer
 
 import android.content.Context
 import android.media.MediaCodec
@@ -83,7 +83,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         decoder.releaseOutputBuffer(bufId, isGoingToRender)
         val presentationTimeMs = it.arg2.toLong()
         if (isGoingToRender) currentPositionMs = presentationTimeMs
-        Log.d(
+        Log.v(
             TAG,
             "ob$bufId released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (isGoingToRender) ", rendered" else ""}"
         )
@@ -123,7 +123,6 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
     private fun parseMessageQueue(): List<MessageTriple> {
         val dump = mutableListOf<String>()
         handler.looper.dump({ s -> dump.add(s) }, "")
-//        Log.d(TAG, "message queue=\n${dump.joinToString("\n")}")
         /* an example of return value of dump()
           Handler (android.os.Handler) {19c03c27} @ 673356246
           Looper (renderThread, tid 31890) {16b62ee6}
@@ -170,7 +169,6 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
      * // TODO: exact seek
      */
     fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_CLOSEST_SYNC) {
-        check(isPlaying()) { "Player is not playing." }
         handler.post {
             Log.i(TAG, "Seek to $positionMs ms.")
             decoder.flush()
@@ -332,7 +330,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         val presentationTimeMs = (presentationTimeUs / 1000).toInt()
         val msg = handler.obtainMessage(WHAT_RELEASE, bufIdAndRenderFlag, presentationTimeMs)
         handler.sendMessageDelayed(msg, timeoutMs)
-        Log.d(
+        Log.v(
             TAG,
             "ob$outputBufferId ($presentationTimeMs) will be ${if (isGoingToRender) "rendered" else "released"} in ${timeoutMs}ms ($tag)"
         )
