@@ -55,6 +55,20 @@ class VideoPlayerTest {
     }
 
     @Test
+    fun seekExact() = launchMainActivityThen { activity ->
+        activity.videoPlayer.also {
+            val video = findVideos(activity.applicationContext)[0]
+            val delta = 100.0
+            it.play(video)
+            Thread.sleep(2000)
+            it.playbackSpeed = 0.0
+            it.seekTo(3500)
+            Thread.sleep(2000)
+            assertEquals(3500.0, it.currentPositionMs.toDouble(), delta)
+        }
+    }
+
+    @Test
     fun seekImmediately() = launchMainActivityThen { activity ->
         activity.videoPlayer.also {
             val video = findVideos(activity.applicationContext)[0]
@@ -64,27 +78,12 @@ class VideoPlayerTest {
             it.seekTo(9_000)
             it.playbackSpeed = 0.5
             Thread.sleep(2000)
+            assertEquals(10_000.0, it.currentPositionMs.toDouble(), delta)
             // seek right after change speed
             it.playbackSpeed = 2.0
             it.seekTo(16_000)
             Thread.sleep(2000)
-            assertEquals(it.currentPositionMs.toDouble(), 20_000.0, delta)
-        }
-    }
-
-    @Test
-    fun changeSpeedImmediately() = launchMainActivityThen { activity ->
-        activity.videoPlayer.also {
-            val video = findVideos(activity.applicationContext)[0]
-            val delta = 200.0
-            it.play(video)
-            // seek right after start playing
-            it.seekTo(8_000)
-            Thread.sleep(2000)
-            // seek right after change speed
-            it.seekTo(16_000)
-            Thread.sleep(2000)
-            assertEquals(it.currentPositionMs.toDouble(), 10_000.0, delta)
+            assertEquals(20_000.0, it.currentPositionMs.toDouble(), delta)
         }
     }
 
@@ -167,22 +166,20 @@ class VideoPlayerTest {
             val video = findVideos(activity.applicationContext)[0]
             val delta = 200.0
             var playedMs = 0.0
+            val timeout = 2000L
             it.play(video)
-            Thread.sleep(3000)
-            playedMs += it.playbackSpeed * 3000.0
-            assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
-            it.playbackSpeed = 6.0
-            Thread.sleep(3000)
-            playedMs += it.playbackSpeed * 3000.0
-            assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
-            it.playbackSpeed = 0.0
-            Thread.sleep(3000)
-            playedMs += it.playbackSpeed * 3000.0
-            assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
-            it.playbackSpeed = 0.1
-            Thread.sleep(3000)
-            playedMs += it.playbackSpeed * 3000.0
-            assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
+
+            fun setSleepAssert(spd: Double) {
+                it.playbackSpeed = spd
+                Thread.sleep(timeout)
+                playedMs += it.playbackSpeed * timeout
+                assertEquals(playedMs, it.currentPositionMs.toDouble(), delta)
+            }
+            setSleepAssert(1.0)
+            setSleepAssert(0.0)
+            setSleepAssert(4.0)
+            setSleepAssert(0.1)
+
         }
     }
 

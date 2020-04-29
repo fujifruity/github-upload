@@ -69,23 +69,23 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
     private val invalidInputBufferIds = mutableListOf<Int>()
     private val invalidOutputBufferIds = mutableListOf<Int>()
 
-    private val handlerThread = HandlerThread("renderThread").also {
+    private val decoderThread = HandlerThread("decoderThread").also {
         // It's not legal to start a thread more than once.
         it.start()
     }
-    private val handler = Handler(handlerThread.looper, Handler.Callback {
+    private val handler = Handler(decoderThread.looper, Handler.Callback {
         if (it.what != WHAT_RELEASE) return@Callback false
         // Release an output buffer according to message arguments.
         val bufIdAndRenderFlag = it.arg1
         val isGoingToRender = bufIdAndRenderFlag and 1 == 1
         val bufId = bufIdAndRenderFlag shr 1
-        // Simultaneously render the buffer onto the surface.
+        // It simultaneously renders the buffer onto the surface.
         decoder.releaseOutputBuffer(bufId, isGoingToRender)
         val presentationTimeMs = it.arg2.toLong()
         if (isGoingToRender) currentPositionMs = presentationTimeMs
         Log.v(
             TAG,
-            "ob$bufId released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (isGoingToRender) ", rendered" else ""}"
+            "outputBuffer$bufId ($presentationTimeMs) released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (isGoingToRender) ", rendered" else ""}"
         )
         true
     })
@@ -96,6 +96,10 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
      */
     var playbackSpeed: Double = 1.0
         set(value) {
+            if (value == playbackSpeed) {
+                Log.i(TAG, "Same playbackSpeed, do nothing.")
+                return
+            }
             handler.post {
                 Log.i(TAG, "New playback speed: $value")
                 if (isPlaying()) {
@@ -105,7 +109,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
                 }
                 field = value
                 intermissionUs = (30_000 * playbackSpeed).toLong()
-                Log.d(TAG, "intermissionMs=${intermissionUs / 1000}")
+                Log.v(TAG, "intermissionMs=${intermissionUs / 1000}")
                 // recreate WHAT_RELEASE messages from posted ones that are invalid now, then post them.
                 val messageTriplets = parseMessageQueue()
                 handler.removeMessages(WHAT_RELEASE)
@@ -115,6 +119,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
                     val outputBufferId = bufIdAndRenderFlag shr 1
                     sendReleaseMessage(outputBufferId, presentationTimeUs, "spd setter")
                 }
+                Log.i(TAG, "playbackSpeed is set.")
             }
         }
 
@@ -146,7 +151,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         return ::videoUri.isInitialized &&
                 ::decoder.isInitialized &&
                 ::extractor.isInitialized &&
-                handlerThread.isAlive
+                decoderThread.isAlive
     }
 
     /**
@@ -164,31 +169,34 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         }
     }
 
-    /**
-     * @param seekMode Default is [MediaExtractor.SEEK_TO_CLOSEST_SYNC]
-     * // TODO: exact seek
-     */
-    fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_CLOSEST_SYNC) {
+    fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
         handler.post {
             Log.i(TAG, "Seek to $positionMs ms.")
+            // Update
+            val positionUs = positionMs * 1000
+            startingPositionUs = positionUs
+            startingErtNs = ertNs()
             decoder.flush()
-            // It removes only messages posted by our handler.
-            handler.removeCallbacksAndMessages(null)
-            // Memorize buffer IDs that MediaCodec.Callback should check and avoid to use.
+            handler.looper.dump({ s -> Log.d(TAG, s) }, "")
+            handler.removeMessages(WHAT_RELEASE)
+            Log.i(TAG, "Remove release messages from the queue.")
+            // memorize buffer ids because some on(In|Out)putBufferAvailable callbacks may outlive flush().
             parseMessageQueue().filter { it.what == WHAT_EVENT_CALLBACK }.forEach {
                 when (it.arg1) {
                     ARG1_INPUT_BUFFER_AVAILABLE -> invalidInputBufferIds.add(it.arg2)
                     ARG1_OUTPUT_BUFFER_AVAILABLE -> invalidOutputBufferIds.add(it.arg2)
                 }
             }
-            val positionUs = positionMs * 1000
+            Log.d(
+                TAG,
+                "invalid buffers: input=$invalidInputBufferIds, output=$invalidOutputBufferIds"
+            )
             extractor.seekTo(positionUs, seekMode)
             decoder.start()
-            // Update starting ones.
-            startingPositionUs = positionUs
-            startingErtNs = ertNs()
-            // only if it is 0, our handler's callback forces decoder to render the next available output buffer (for responsiveness).
-            lastAcceptedRenderingTimeUs = 0L
+            lastAcceptedRenderingTimeUs = 0
+            isAfterSeek = true
+            lastInputBufferId = -1
+            Log.i(TAG, "Seek finished.")
         }
     }
 
@@ -219,7 +227,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
      */
     fun close() {
         handler.post(release)
-        handler.post { handlerThread.quit() }
+        handler.post { decoderThread.quit() }
     }
 
     /**
@@ -266,30 +274,38 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
 
     /**
      * "renderingTime" is defined in [calculateTimeoutMs].
-     * We should initialize it every time perform seek.
+     * We should initialize it every time perform seek or change [playbackSpeed].
      */
     private var lastAcceptedRenderingTimeUs = 0L
     private var intermissionUs = 30_000L
+    private var isAfterSeek = false
+    private var lastInputBufferId = -1
 
     /**
-     * Calculate the timeout to next rendering for the presentation time of output buffer.
-     * When it returns 0, decoder should not render the buffer.
+     * Calculate the timeout to next rendering according to the presentation time of output buffer.
+     * When it returns null, decoder should not render the buffer.
      */
-    private fun calculateTimeoutMs(presentationTimeUs: Long): Long {
+    private fun calculateTimeoutMs(presentationTimeUs: Long): Long? {
         val expectedPositionUs = expectedPositionUs
-        val timeoutUs = ((presentationTimeUs - expectedPositionUs) / playbackSpeed).toLong()
-            .coerceIn(0, 3600_000_000)
+        val timeoutCandidateUs =
+            ((presentationTimeUs - expectedPositionUs) / playbackSpeed).toLong()
+                .coerceAtMost(3600_000_000)
+        if (timeoutCandidateUs < 0) return null
         // tricky definition: position + real time
-        val renderingTimeUs = expectedPositionUs + timeoutUs
-        val finalTimeoutUs = when {
-            // we want to render just once when seek finished, for responsiveness.
-            lastAcceptedRenderingTimeUs == 0L -> 1
-            // or, when there is enough distance between renderingTime and lastAcceptedRenderingTimeUs.
-            (renderingTimeUs - lastAcceptedRenderingTimeUs).absoluteValue >= intermissionUs -> timeoutUs / 1000
-            else -> 0
+        val renderingTimeUs = expectedPositionUs + timeoutCandidateUs
+        val timeoutMs = when {
+            // we want to render just once whenever seekTo() finished, for responsiveness.
+            isAfterSeek -> {
+                isAfterSeek = false
+                0
+            }
+            (lastAcceptedRenderingTimeUs - renderingTimeUs).absoluteValue >= intermissionUs -> {
+                lastAcceptedRenderingTimeUs = renderingTimeUs
+                timeoutCandidateUs / 1000
+            }
+            else -> null
         }
-        if (finalTimeoutUs > 0) lastAcceptedRenderingTimeUs = renderingTimeUs
-        return finalTimeoutUs
+        return timeoutMs
         /*
          .startingPosition  \\          .expectedPosition->      presentationTime
             x1.0 | x2.0     //                  |                      |
@@ -300,20 +316,18 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
          .expectedPosition :=  .startingPosition + 2.0 * ertSinceSpeedSet
                    timeout := (presentationTime - .expectedPosition) / 2.0
 
-                  |        |       |             |<--intermission-->|
-                --|--------|-------|-------------|---------+--------+-+---> time
-                  <---------timeout0------------->         |          |
-                  |        <-----------timeout1------------>          |
-                  +        |       <--------------timeout2------------>
+                  |        |       |             |<-intermission->|
+                --|--------|-------|-------------|---------+------+---+---> time
+                  |<----------timeout0---------->|         |          |
+                  |        |<----------timeout1----------->|          |
+                  +        |       |<-------------timeout2----------->|
          expectedPosition0 +       |             +         |          |
                  expectedPosition1 +      renderingTime0   +          |
                           expectedPosition2          renderingTime1   +
                                                                renderingTime2
-
-              intermission := 30 * log2(playbackSpeed + 1)  e.g.: 0.5x->18, 1x->30, 2x->48, 4x->70
            renderingTime_n := expectedPosition_n + timeout_n
-         isGoingToRender_n := |renderingTime - last accepted renderingTime| > intermission
-               return value = isGoingToRender_n && timeout_n > 0 ? timeout_n : 0
+         isGoingToRender_n := timeout_n > 0 && |renderingTime_n - lastAcceptedRenderingTime| > intermission
+               return value = isGoingToRender_n ? timeout_n : 0
 
          Caller1 should not render the buffer it holds because renderingTime1 is too close to renderingTime0.
          Return values for these callers (onOutputBufferAvailable or playbackSpeed) will be:
@@ -324,25 +338,35 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
     }
 
     private fun sendReleaseMessage(outputBufferId: Int, presentationTimeUs: Long, tag: String) {
-        val timeoutMs = calculateTimeoutMs(presentationTimeUs)
-        val isGoingToRender = timeoutMs > 0L
+        val (timeoutMs, isGoingToRender) =
+            calculateTimeoutMs(presentationTimeUs)?.let { it to true } ?: 0L to false
         val bufIdAndRenderFlag = (outputBufferId shl 1) + if (isGoingToRender) 1 else 0
         val presentationTimeMs = (presentationTimeUs / 1000).toInt()
         val msg = handler.obtainMessage(WHAT_RELEASE, bufIdAndRenderFlag, presentationTimeMs)
         handler.sendMessageDelayed(msg, timeoutMs)
         Log.v(
             TAG,
-            "ob$outputBufferId ($presentationTimeMs) will be ${if (isGoingToRender) "rendered" else "released"} in ${timeoutMs}ms ($tag)"
+            "outputBuffer$outputBufferId ($presentationTimeMs) will be ${if (isGoingToRender) "rendered" else "released"} in ${timeoutMs}ms ($tag)"
         )
     }
 
+
     private val decoderCallback = object : MediaCodec.Callback() {
+
         override fun onInputBufferAvailable(decoder: MediaCodec, inputBufferId: Int) {
             if (invalidInputBufferIds.remove(inputBufferId)) {
-                Log.i(TAG, "inputBuffer $inputBufferId is invalid, skip.")
+                Log.i(TAG, "inputBuffer$inputBufferId is invalid, skip.")
                 return
             }
-            Log.v(TAG, "inputBuffer $inputBufferId is available.")
+            if (inputBufferId == lastInputBufferId) {
+                // after MediaCodec.flush(), sometimes the same input buffer get available repeatedly,
+                // then next getInputBuffer() may causes segfault.
+                Log.i(TAG, "inputBuffer$inputBufferId is repeated, skip.")
+                return
+            }
+            lastInputBufferId = inputBufferId
+
+            Log.v(TAG, "inputBuffer$inputBufferId is available.")
             val inputBuffer = decoder.getInputBuffer(inputBufferId)!!
             val sampleSize = extractor.readSampleData(inputBuffer, 0)
             if (sampleSize < 0) {
@@ -365,12 +389,16 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
             outputBufferId: Int,
             bufferInfo: MediaCodec.BufferInfo
         ) {
-            if (invalidOutputBufferIds.remove(outputBufferId)) {
-                Log.i(TAG, "outputBuffer $outputBufferId is invalid, skip.")
-            } else if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
-                Log.i(TAG, "OutputBuffer BUFFER_FLAG_END_OF_STREAM")
-            } else {
-                sendReleaseMessage(outputBufferId, bufferInfo.presentationTimeUs, "oOBA")
+            when {
+                invalidOutputBufferIds.remove(outputBufferId) -> {
+                    Log.i(TAG, "outputBuffer$outputBufferId is invalid, skip.")
+                }
+                bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0 -> {
+                    Log.i(TAG, "outputBuffer$outputBufferId BUFFER_FLAG_END_OF_STREAM")
+                }
+                else -> {
+                    sendReleaseMessage(outputBufferId, bufferInfo.presentationTimeUs, "oOBA")
+                }
             }
         }
 
