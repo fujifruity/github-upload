@@ -11,6 +11,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
+
 /**
  * Instrumented test, which will execute on an Android device.
  *
@@ -50,7 +51,7 @@ class VideoPlayerTest {
         activity.videoPlayer.also {
             val video = findVideos(activity.applicationContext)[0]
             it.play(video)
-            Thread.sleep(5000)
+            Thread.sleep(1000)
         }
     }
 
@@ -62,8 +63,12 @@ class VideoPlayerTest {
             it.play(video)
             Thread.sleep(2000)
             it.playbackSpeed = 0.0
-            it.seekTo(3500)
+            it.seekTo(3300)
             Thread.sleep(2000)
+            assertEquals(3300.0, it.currentPositionMs.toDouble(), delta)
+            // // TODO: do it speedy
+            it.seekTo(3500)
+            Thread.sleep(100)
             assertEquals(3500.0, it.currentPositionMs.toDouble(), delta)
         }
     }
@@ -75,9 +80,8 @@ class VideoPlayerTest {
             val delta = 200.0
             it.play(video)
             // seek right after start playing
-            it.seekTo(9_000)
-            it.playbackSpeed = 0.5
-            Thread.sleep(2000)
+            it.seekTo(6_000)
+            Thread.sleep(4000)
             assertEquals(10_000.0, it.currentPositionMs.toDouble(), delta)
             // seek right after change speed
             it.playbackSpeed = 2.0
@@ -105,7 +109,21 @@ class VideoPlayerTest {
     }
 
     @Test
-    fun performSeek() = launchMainActivityThen { activity ->
+    fun seekToBeginning() = launchMainActivityThen { activity ->
+        activity.videoPlayer.also {
+            val video = findVideos(activity.applicationContext)[0]
+            it.play(video)
+            val delta = 100.0
+            Thread.sleep(2000)
+            it.playbackSpeed = 0.0
+            it.seekTo(0)
+            Thread.sleep(2000)
+            assertEquals(0.0, it.currentPositionMs.toDouble(), delta)
+        }
+    }
+
+    @Test
+    fun seekForwardBackward() = launchMainActivityThen { activity ->
         activity.videoPlayer.also {
             val video = findVideos(activity.applicationContext)[0]
             it.play(video)
@@ -113,12 +131,12 @@ class VideoPlayerTest {
             Thread.sleep(2000)
             // Seek forward.
             it.seekTo(7000)
-            Thread.sleep(2000)
-            assertEquals(9000.0, it.currentPositionMs.toDouble(), delta)
+            Thread.sleep(1000)
+            assertEquals(8000.0, it.currentPositionMs.toDouble(), delta)
             // Seek backward.
-            it.seekTo(1000)
-            Thread.sleep(2000)
-            assertEquals(3000.0, it.currentPositionMs.toDouble(), delta)
+            it.seekTo(3000)
+            Thread.sleep(1000)
+            assertEquals(4000.0, it.currentPositionMs.toDouble(), delta)
         }
     }
 
