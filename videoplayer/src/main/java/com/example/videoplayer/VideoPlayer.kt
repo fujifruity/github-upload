@@ -288,12 +288,14 @@ class PlaybackSession(
             decoder.flush()
             decoder.start()
             handler.removeMessages(WHAT_RELEASE_BUFFER)
+            Log.d(TAG, "removed release messages=\n${pendingMessageProperties.joinToString("\n")}")
             pendingMessageProperties.clear()
             // prevents outlived onOutputBufferAvailable from sending invalid buffer release messages.
             hasOutdatedOutputBuffer = true
             startingKeyframeTimestampUs = extractor.sampleTime
         }
-        // According to reference: if you flush the codec too soon after start() – generally, before the first output buffer or output format change is received – you will need to resubmit the codec-specific-data to the codec.
+        // when we flush the codec before the output format change is received,
+        // we have to resubmit the codec-specific-data.
         if (!hasFormatChanged) {
             pendingSeekRequest = seekRequest
         } else {

@@ -3,7 +3,6 @@ package com.example.decodersample
 import android.content.ContentUris
 import android.content.Context
 import android.media.MediaExtractor
-import android.media.MediaFormat
 import android.net.Uri
 import android.provider.MediaStore
 import androidx.test.core.app.launchActivity
@@ -48,11 +47,11 @@ class VideoPlayerTest {
         scenario.onActivity(action)
     }
 
-    fun withPlayerAndVideos(action: (player: VideoPlayer, videos: List<Uri>) -> Unit) {
+    fun withPlayerAndVideos(action: (player: VideoPlayer, videos: List<Uri>, mainActivity: MainActivity) -> Unit) {
         withMainActivity { activity ->
             activity.videoPlayer.also { player ->
                 val videos = findVideos(activity.applicationContext)
-                action(player, videos)
+                action(player, videos, activity)
             }
         }
     }
@@ -60,16 +59,8 @@ class VideoPlayerTest {
     fun keyframeTimestampsUs(context: Context, videoUri: Uri): List<Long> {
         val extractor = MediaExtractor().also { extractor ->
             extractor.setDataSource(context, videoUri, null)
-            val (videoTrackIdToVideoFormat, mime) = 0.until(extractor.trackCount).map { trackId ->
-                val format = extractor.getTrackFormat(trackId)
-                val mime = format.getString(MediaFormat.KEY_MIME)!!
-                Pair(trackId, format) to mime
-            }.find { (_, mime) ->
-                mime.startsWith("video/")
-            }!!
-            val (trackId, format) = videoTrackIdToVideoFormat
             // Configure extractor with video track.
-            extractor.selectTrack(trackId)
+            extractor.selectTrack(0)
         }
         // It may take some time. e.g. 300ms for 1h video.
         return sequence {
@@ -77,11 +68,22 @@ class VideoPlayerTest {
                 yield(extractor.sampleTime)
                 extractor.seekTo(extractor.sampleTime + 1, MediaExtractor.SEEK_TO_NEXT_SYNC)
             }
+            extractor.release()
         }.toList()
     }
 
+//    fun VideoPlayer.playThenSleep1s(videoUri: Uri){
+//        this.play(videoUri)
+//        Thread.sleep(1000)
+//    }
+
+    fun VideoPlayer.seekToThenSleep(positionMs: Long, sleepLengthMs: Long) {
+        this.seekTo(positionMs)
+        Thread.sleep(sleepLengthMs)
+    }
+
     @Test
-    fun justPlay() = withPlayerAndVideos { player, videos ->
+    fun justPlay() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
         player.play(videos[0])
         Thread.sleep(2000)
@@ -89,95 +91,91 @@ class VideoPlayerTest {
     }
 
     @Test
-    fun seekExact() = withPlayerAndVideos { player, videos ->
+    fun seekExact() = withPlayerAndVideos { player, videos, context ->
         val delta = 100.0
         val video = videos[0]
         player.play(video)
-        Thread.sleep(2000)
         player.playbackSpeed = 0.0
-        player.seekTo(3300)
-        Thread.sleep(2000)
-        assertEquals(3300.0, player.currentPositionMs.toDouble(), delta)
+        val midPosition = keyframeTimestampsUs(context, video).drop(7).take(2).sum() / 2 / 1000
+        player.seekToThenSleep(midPosition, 1000)
+        assertEquals(
+            "seek to the position which is far from surrounding keyframes'",
+            midPosition.toDouble(), player.currentPositionMs.toDouble(), delta
+        )
     }
 
     @Test
-    fun seekImmediately() = withPlayerAndVideos { player, videos ->
-        val delta = 200.0
+    fun seekImmediately() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 100.0
         player.play(videos[0])
-        // seek immediately after start playing
-        player.seekTo(8_000)
-        Thread.sleep(2000)
-        assertEquals(10_000.0, player.currentPositionMs.toDouble(), delta)
-        // seek immediately after change speed
-//            it.playbackSpeed = 2.0
-        player.seekTo(16_000)
+        player.seekToThenSleep(9000, 1000)
+        assertEquals(
+            "seek immediately after start playing",
+            10000.0, player.currentPositionMs.toDouble(), delta
+        )
         player.playbackSpeed = 2.0
-        Thread.sleep(2000)
-        assertEquals(20_000.0, player.currentPositionMs.toDouble(), delta)
+        player.seekToThenSleep(18000, 1000)
+        assertEquals(
+            "seek immediately after change speed",
+            20000.0, player.currentPositionMs.toDouble(), delta
+        )
+        player.seekTo(9000)
+        player.playbackSpeed = 1.0
+        Thread.sleep(1000)
+        assertEquals(
+            "seek then change speed",
+            10_000.0, player.currentPositionMs.toDouble(), delta
+        )
     }
 
     @Test
-    fun seekToBeginning() = withPlayerAndVideos { player, videos ->
-        player.play(videos[0])
+    fun seekToBeginning() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
-        Thread.sleep(2000)
+        player.play(videos[0])
+        Thread.sleep(1000)
+        player.seekToThenSleep(0, 1000)
+        assertEquals("seek with normal speed", 1000.0, player.currentPositionMs.toDouble(), delta)
         player.playbackSpeed = 0.0
-        player.seekTo(0)
-        Thread.sleep(2000)
-        assertEquals(0.0, player.currentPositionMs.toDouble(), delta)
+        player.seekTo(0, 1000)
+        // TODO: fails because extractor.seekTo() cannot seek to 0ms
+        assertEquals("seek with pause", 0.0, player.currentPositionMs.toDouble(), delta)
     }
 
     @Test
-    fun seekForwardBackward() = withPlayerAndVideos { player, videos ->
+    fun changeVideoWhilePlaying() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 100.0
         player.play(videos[0])
-        val delta = 100.0
         Thread.sleep(2000)
-        // Seek forward.
-        player.seekTo(7000)
-        Thread.sleep(1000)
-        assertEquals(8000.0, player.currentPositionMs.toDouble(), delta)
-        // Seek backward.
-        player.seekTo(3000)
-        Thread.sleep(1000)
-        assertEquals(4000.0, player.currentPositionMs.toDouble(), delta)
-    }
-
-    @Test
-    fun changeVideoWhilePlaying() = withPlayerAndVideos { player, videos ->
-        val delta = 100.0
+        assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
+        assertEquals(player.videoUri, videos[0])
+        Thread.sleep(2000)
         player.play(videos[1])
+        Thread.sleep(2000)
         assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
         assertEquals(player.videoUri, videos[1])
-        Thread.sleep(2000)
-        // Change video and check player state.
-        player.play(videos[2])
-        Thread.sleep(2000)
-        assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
-        assertEquals(player.videoUri, videos[2])
     }
 
     @Test
-    fun playToTheEndThenPause() = withPlayerAndVideos { player, videos ->
-        val delta = 1000.0
-        player.play(videos[1])
+    fun playToTheEndThenPause() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 100.0
+        player.play(videos[0])
+        player.playbackSpeed = 0.3
         Thread.sleep(1000)
         repeat(2) {
             // Seek to the right before the end, then check player's state.
             player.seekTo(player.durationMs)
-            Thread.sleep(4000)
-            // TODO: render once extractor sought
+            Thread.sleep(2000)
             assertEquals(player.durationMs.toDouble(), player.currentPositionMs.toDouble(), delta)
         }
     }
 
     @Test
-    fun changePlaybackSpeed() = withPlayerAndVideos { player, videos ->
+    fun changePlaybackSpeed() = withPlayerAndVideos { player, videos, _ ->
         val delta = 200.0
         var playedMs = 0.0
         val timeout = 2000L
         player.play(videos[0])
-        Thread.sleep(timeout)
-        listOf(0.0, 4.0, 0.1).forEach { spd ->
+        listOf(4.0, 0.1, 0.0).forEach { spd ->
             player.playbackSpeed = spd
             Thread.sleep(timeout)
             playedMs += player.playbackSpeed * timeout
