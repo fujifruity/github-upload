@@ -9,6 +9,7 @@ import android.net.Uri
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import android.os.Message
 import android.util.Log
 import android.view.Surface
 import java.util.concurrent.SynchronousQueue
@@ -67,6 +68,10 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         playbackThread.quit()
     }
 
+    fun isPlaying(): Boolean {
+        return session != null
+    }
+
     fun seekTo(positionMs: Long, mode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
         session!!.seekTo(positionMs, mode)
     }
@@ -112,39 +117,132 @@ class PlaybackSession(
             return predictedPosition.coerceAtMost(durationUs)
         }
 
-    data class BufferReleaseProperty(
-        val outputBufferId: Int,
-        val presentationTimeUs: Long,
-        val hasToRender: Boolean
-    )
+    private val handler = object : Handler(looper) {
+        /**
+         * Buffer release messages that are pending will go invalid when [playbackSpeed] is changed or
+         * [seekTo] is called. While [seekTo] only requires to remove all messages, [playbackSpeed]'s
+         * setter has to recreate messages and send them again so as not to skip any frame.
+         * Since there is probably no way to peek messages ([Looper.dump] does, but its format is not
+         * reliable), the recreation needs all pending messages' properties.
+         * - who adds an element: [sendReleaseMessage]
+         * - who removes an element: [handler]'s onMessage callback
+         * - who removes all elements: [seekTo] and [playbackSpeed]'s setter
+         */
+        private val queuedReleaseProperties = mutableListOf<ReleaseProperty>()
+        private val WHAT_RELEASE_BUFFER = 1001
 
-    /**
-     * Buffer release messages that are pending will go invalid when [playbackSpeed] is changed or
-     * [seekTo] is called. While [seekTo] only requires to remove all messages, [playbackSpeed]'s
-     * setter has to recreate messages and send them again so as not to skip any frame.
-     * Since there is probably no way to peek messages ([Looper.dump] does, but its format is not
-     * reliable), the recreation needs all pending messages' properties.
-     * - who adds an element: [sendReleaseMessage]
-     * - who removes an element: [handler]'s onMessage callback
-     * - who removes all elements: [seekTo] and [playbackSpeed]'s setter
-     */
-    private val pendingMessageProperties = mutableListOf<BufferReleaseProperty>()
+        inner class ReleaseProperty(
+            val outputBufferId: Int,
+            val presentationTimeUs: Long,
+            val hasToRender: Boolean
+        ) {
+            // inner class cannot be data class
+            operator fun component1() = outputBufferId
+            operator fun component2() = presentationTimeUs
+            operator fun component3() = hasToRender
+        }
 
-    private val handler = Handler(looper, Handler.Callback {
-        if (it.what != WHAT_RELEASE_BUFFER) return@Callback false
-        val property = it.obj as BufferReleaseProperty
-        pendingMessageProperties.remove(property)
-        val (bufId, presentationTimeUs, hasToRender) = property
-        // simultaneously renders the buffer onto the surface.
-        decoder.releaseOutputBuffer(bufId, hasToRender)
-        val presentationTimeMs = presentationTimeUs / 1000
-        if (hasToRender) currentPositionMs = presentationTimeMs
-        Log.v(
-            TAG,
-            "outputBuffer$bufId ($presentationTimeMs) released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (hasToRender) ", rendered" else ""}"
-        )
-        true
-    })
+        override fun handleMessage(msg: Message) {
+            if (msg.what != WHAT_RELEASE_BUFFER) return
+            val property = msg.obj as ReleaseProperty
+            queuedReleaseProperties.remove(property)
+            val (bufId, presentationTimeUs, hasToRender) = property
+            val presentationTimeMs = presentationTimeUs / 1000
+            if (hasToRender) currentPositionMs = presentationTimeMs
+            Log.v(
+                TAG,
+                "outputBuffer$bufId ($presentationTimeMs) released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (hasToRender) ", rendered" else ""}"
+            )
+            // simultaneously renders the buffer onto the surface.
+            decoder.releaseOutputBuffer(bufId, hasToRender)
+        }
+
+        private fun sendReleaseMessage(prop: ReleaseProperty, timeoutMs: Long, tag: String) {
+            val msg = obtainMessage(WHAT_RELEASE_BUFFER, prop)
+            sendMessageDelayed(msg, timeoutMs)
+            queuedReleaseProperties.add(prop)
+            val (outputBufferId, presentationTimeUs, hasToRender) = prop
+            Log.v(
+                TAG,
+                "outputBuffer$outputBufferId (${presentationTimeUs / 1000}) will be ${if (hasToRender) "rendered" else "released"} in ${timeoutMs}ms ($tag)"
+            )
+        }
+
+        fun render(outputBufferId: Int, presentationTimeUs: Long, tag: String) {
+            sendReleaseMessage(
+                ReleaseProperty(outputBufferId, presentationTimeUs, true),
+                0,
+                tag
+            )
+        }
+
+        /** Schedules releasing output buffer after calculating timeout. */
+        fun postBufferRelease(outputBufferId: Int, presentationTimeUs: Long, tag: String) {
+            val (timeoutMs, hasToRender) = run {
+                val expectedPositionUs = expectedPositionUs
+                val timeoutCandidateUs =
+                    ((presentationTimeUs - expectedPositionUs) / playbackSpeed).toLong()
+                        .coerceAtMost(3600_000_000)
+                if (timeoutCandidateUs < 0) return@run 0L to false
+                // tricky definition: position + real time
+                val renderingTimeUs = expectedPositionUs + timeoutCandidateUs
+                val isWellSeparated =
+                    (lastAcceptedRenderingTimeUs - renderingTimeUs).absoluteValue >= intermissionUs
+                if (isWellSeparated) {
+                    lastAcceptedRenderingTimeUs = renderingTimeUs
+                    timeoutCandidateUs / 1000 to true
+                } else 0L to false
+            }
+            sendReleaseMessage(
+                ReleaseProperty(outputBufferId, presentationTimeUs, hasToRender),
+                timeoutMs,
+                tag
+            )
+            /*
+        .startingPosition  \\          .expectedPosition->      presentationTime
+           x1.0 | x2.0     //                  |                      |
+        -------------------\\--------------------------------------------> position
+                | <--2.0 * ertSinceSpeedSet--> | <---2.0 * timeout--> |
+                |          \\                  |                      |
+
+        .expectedPosition :=  .startingPosition + 2.0 * ertSinceSpeedSet
+                  timeout := (presentationTime - .expectedPosition) / 2.0
+
+                |        |       |             |<-intermission->|
+              --|--------|-------|-------------|---------+------+---+---> time
+                |<----------timeout0---------->|         |          |
+                |        |<----------timeout1----------->|          |
+                +        |       |<-------------timeout2----------->|
+        expectedPosition0 +      |             +         |          |
+               expectedPosition1 +      renderingTime0   +          |
+                        expectedPosition2          renderingTime1   +
+                                                             renderingTime2
+        renderingTime_n := expectedPosition_n + timeout_n
+          hasToRender_n := timeout_n > 0 && |renderingTime_n - lastAcceptedRenderingTime| > intermission
+            return value = hasToRender_n ? timeout_n : 0
+
+        Caller1 should not render the buffer it holds because renderingTime1 is too close to renderingTime0.
+        Return values for these callers (onOutputBufferAvailable or playbackSpeed) will be:
+        caller0: timeout0
+        caller1: 0
+        caller2: timeout2
+             */
+        }
+
+        fun cancelBufferRelease() {
+            removeMessages(WHAT_RELEASE_BUFFER)
+            queuedReleaseProperties.clear()
+        }
+
+        fun updateBufferRelease() {
+            val props = queuedReleaseProperties.toList()
+            cancelBufferRelease()
+            props.forEach { (bufId, presentationTimeUs, _) ->
+                postBufferRelease(bufId, presentationTimeUs, "spd setter")
+            }
+        }
+
+    }
 
     private val decoderCallback: MediaCodec.Callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(decoder: MediaCodec, bufferId: Int) {
@@ -174,8 +272,7 @@ class PlaybackSession(
                 if (bufferInfo.presentationTimeUs == startingKeyframeTimestampUs) {
                     Log.i(TAG, "$bufIdWithTimestamp has the target key frame of seek")
                     hasOutdatedOutputBuffer = false
-                    val prop = BufferReleaseProperty(bufferId, bufferInfo.presentationTimeUs, true)
-                    sendReleaseMessage(prop, 0L, "oOBA")
+                    handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
                 } else {
                     Log.i(TAG, "$bufIdWithTimestamp is outdated, skipped")
                 }
@@ -184,10 +281,9 @@ class PlaybackSession(
                 // how long the rendering timeout is.
                 Log.i(TAG, "$bufIdWithTimestamp playback is caught up")
                 isCaughtUp = true
-                val prop = BufferReleaseProperty(bufferId, bufferInfo.presentationTimeUs, true)
-                sendReleaseMessage(prop, 0L, "oOBA")
+                handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
             } else {
-                sendReleaseMessageDelayed(bufferId, bufferInfo.presentationTimeUs, "oOBA")
+                handler.postBufferRelease(bufferId, bufferInfo.presentationTimeUs, "oOBA")
             }
         }
 
@@ -234,7 +330,7 @@ class PlaybackSession(
      */
     fun close() {
         handler.post {
-            handler.removeMessages(WHAT_RELEASE_BUFFER)
+            handler.cancelBufferRelease()
             Log.i(TAG, "releasing extractor and decoder")
             decoder.release()
             extractor.release()
@@ -247,25 +343,18 @@ class PlaybackSession(
      */
     var playbackSpeed: Double = 1.0
         set(value) {
-            if (value == playbackSpeed) {
-                Log.i(TAG, "Same playbackSpeed, nothing to do")
-                return
-            }
+            if (value == playbackSpeed) return
             handler.post {
                 Log.i(TAG, "Setting playback speed x$value")
-                // expectedPositionUs needs old playbackSpeed.
+                // used to calculate buffer release timeout
                 startingPositionUs = expectedPositionUs
                 startingErtNs = ertNs()
                 field = value
+                // prevents over-paced rendering
                 intermissionUs = (30_000 * playbackSpeed).toLong()
                 Log.v(TAG, "intermissionMs=${intermissionUs / 1000}")
-                // recreate and send release buffer messages that are pending and invalid now.
-                handler.removeMessages(WHAT_RELEASE_BUFFER)
-                val copy = pendingMessageProperties.toList()
-                pendingMessageProperties.clear()
-                copy.forEach { (bufId, presentationTimeUs, _) ->
-                    sendReleaseMessageDelayed(bufId, presentationTimeUs, "spd setter")
-                }
+                // scheduled buffer releases are invalid now, reschedule.
+                handler.updateBufferRelease()
             }
         }
 
@@ -279,17 +368,17 @@ class PlaybackSession(
         val seekRequest = Runnable {
             val positionUs = (positionMs * 1000).coerceIn(0, durationUs)
             Log.i(TAG, "Seek to ${positionMs}ms (actual: ${positionUs / 1000}ms)")
-            // TODO: create `ContinuousPlayback` to remove these re-initialization code
             startingPositionUs = positionUs
             startingErtNs = ertNs()
             lastAcceptedRenderingTimeUs = 0L
             isCaughtUp = false
-            extractor.seekTo(positionUs, seekMode)
+            extractor.seekTo(
+                positionUs,
+                if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
+            )
             decoder.flush()
             decoder.start()
-            handler.removeMessages(WHAT_RELEASE_BUFFER)
-            Log.d(TAG, "removed release messages=\n${pendingMessageProperties.joinToString("\n")}")
-            pendingMessageProperties.clear()
+            handler.cancelBufferRelease()
             // prevents outlived onOutputBufferAvailable from sending invalid buffer release messages.
             hasOutdatedOutputBuffer = true
             startingKeyframeTimestampUs = extractor.sampleTime
@@ -301,76 +390,6 @@ class PlaybackSession(
         } else {
             handler.post(seekRequest)
         }
-    }
-
-    /**
-     * Schedules releasing output buffer after calculating timeout.
-     */
-    private fun sendReleaseMessageDelayed(
-        outputBufferId: Int,
-        presentationTimeUs: Long,
-        tag: String
-    ) {
-        val (timeoutMs, hasToRender) = run {
-            val expectedPositionUs = expectedPositionUs
-            val timeoutCandidateUs =
-                ((presentationTimeUs - expectedPositionUs) / playbackSpeed).toLong()
-                    .coerceAtMost(3600_000_000)
-            if (timeoutCandidateUs < 0) return@run 0L to false
-            // tricky definition: position + real time
-            val renderingTimeUs = expectedPositionUs + timeoutCandidateUs
-            val isWellSeparated =
-                (lastAcceptedRenderingTimeUs - renderingTimeUs).absoluteValue >= intermissionUs
-            if (isWellSeparated) {
-                lastAcceptedRenderingTimeUs = renderingTimeUs
-                timeoutCandidateUs / 1000 to true
-            } else 0L to false
-        }
-        sendReleaseMessage(
-            BufferReleaseProperty(outputBufferId, presentationTimeUs, hasToRender),
-            timeoutMs,
-            tag
-        )
-        /*
-    .startingPosition  \\          .expectedPosition->      presentationTime
-       x1.0 | x2.0     //                  |                      |
-    -------------------\\--------------------------------------------> position
-            | <--2.0 * ertSinceSpeedSet--> | <---2.0 * timeout--> |
-            |          \\                  |                      |
-
-    .expectedPosition :=  .startingPosition + 2.0 * ertSinceSpeedSet
-              timeout := (presentationTime - .expectedPosition) / 2.0
-
-            |        |       |             |<-intermission->|
-          --|--------|-------|-------------|---------+------+---+---> time
-            |<----------timeout0---------->|         |          |
-            |        |<----------timeout1----------->|          |
-            +        |       |<-------------timeout2----------->|
-    expectedPosition0 +      |             +         |          |
-           expectedPosition1 +      renderingTime0   +          |
-                    expectedPosition2          renderingTime1   +
-                                                         renderingTime2
-    renderingTime_n := expectedPosition_n + timeout_n
-      hasToRender_n := timeout_n > 0 && |renderingTime_n - lastAcceptedRenderingTime| > intermission
-        return value = hasToRender_n ? timeout_n : 0
-
-    Caller1 should not render the buffer it holds because renderingTime1 is too close to renderingTime0.
-    Return values for these callers (onOutputBufferAvailable or playbackSpeed) will be:
-    caller0: timeout0
-    caller1: 0
-    caller2: timeout2
-         */
-    }
-
-    private fun sendReleaseMessage(property: BufferReleaseProperty, timeoutMs: Long, tag: String) {
-        val msg = handler.obtainMessage(WHAT_RELEASE_BUFFER, property)
-        handler.sendMessageDelayed(msg, timeoutMs)
-        pendingMessageProperties.add(property)
-        val (outputBufferId, presentationTimeUs, hasToRender) = property
-        Log.v(
-            TAG,
-            "outputBuffer$outputBufferId (${presentationTimeUs / 1000}) will be ${if (hasToRender) "rendered" else "released"} in ${timeoutMs}ms ($tag)"
-        )
     }
 
     /**
@@ -386,7 +405,7 @@ class PlaybackSession(
             sampleTimeUs = extractor.sampleTime
             extractor.advance()
         }
-        // TODO: always seek to around 1s, not 0s
+        // TODO: always seeks to around 1s (second keyframe?), not 0s
         extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
         sampleTimeUs
     }
@@ -398,9 +417,6 @@ class PlaybackSession(
 
     companion object {
         private val TAG = PlaybackSession::class.java.simpleName
-
-        const val WHAT_RELEASE_BUFFER = 1001
-
     }
 }
 

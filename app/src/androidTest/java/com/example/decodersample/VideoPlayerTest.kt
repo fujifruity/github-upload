@@ -72,11 +72,6 @@ class VideoPlayerTest {
         }.toList()
     }
 
-//    fun VideoPlayer.playThenSleep1s(videoUri: Uri){
-//        this.play(videoUri)
-//        Thread.sleep(1000)
-//    }
-
     fun VideoPlayer.seekToThenSleep(positionMs: Long, sleepLengthMs: Long) {
         this.seekTo(positionMs)
         Thread.sleep(sleepLengthMs)
@@ -106,6 +101,7 @@ class VideoPlayerTest {
 
     @Test
     fun seekImmediately() = withPlayerAndVideos { player, videos, _ ->
+        // TODO: random crash (segmentation fault)
         val delta = 100.0
         player.play(videos[0])
         player.seekToThenSleep(9000, 1000)
@@ -113,18 +109,18 @@ class VideoPlayerTest {
             "seek immediately after start playing",
             10000.0, player.currentPositionMs.toDouble(), delta
         )
-        player.playbackSpeed = 2.0
-        player.seekToThenSleep(18000, 1000)
-        assertEquals(
-            "seek immediately after change speed",
-            20000.0, player.currentPositionMs.toDouble(), delta
-        )
-        player.seekTo(9000)
-        player.playbackSpeed = 1.0
+        player.seekTo(9500)
+        player.playbackSpeed = 0.5
         Thread.sleep(1000)
         assertEquals(
             "seek then change speed",
             10_000.0, player.currentPositionMs.toDouble(), delta
+        )
+        player.playbackSpeed = 1.5
+        player.seekToThenSleep(18500, 1000)
+        assertEquals(
+            "seek immediately after change speed",
+            20000.0, player.currentPositionMs.toDouble(), delta
         )
     }
 
