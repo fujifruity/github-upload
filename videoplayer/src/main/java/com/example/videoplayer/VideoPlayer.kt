@@ -93,10 +93,9 @@ class PlaybackSession(
     /** "renderingTime" is defined in [calculateTimeoutMs]. */
     private var lastAcceptedRenderingTimeUs = 0L
     private var intermissionUs = 30_000L
-    private var hasOutdatedOutputBuffer = false
+    private var hasFirstKeyframeProcessed = false
     private var hasFormatChanged = false
-    private var isCaughtUp = false
-    private var pendingSeekRequest: Runnable? = null
+    private var isCaughtUp = true
 
     /** Elapsed real-time since system boot. */
     private fun ertNs() = System.nanoTime()
@@ -106,9 +105,6 @@ class PlaybackSession(
 
     /** The last position at which [playbackSpeed] is changed or start playback. */
     private var startingPositionUs = 0L
-
-    /** Must be updated [extractor].seekTo() is called. */
-    private var startingKeyframeTimestampUs = 0L
 
     private val expectedPositionUs: Long
         get() {
@@ -151,7 +147,7 @@ class PlaybackSession(
             if (hasToRender) currentPositionMs = presentationTimeMs
             Log.v(
                 TAG,
-                "outputBuffer$bufId ($presentationTimeMs) released, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (hasToRender) ", rendered" else ""}"
+                "outputBuffer$bufId ($presentationTimeMs) release, exp=${expectedPositionUs / 1000}, cur=${currentPositionMs}${if (hasToRender) ", rendered" else ""}"
             )
             // simultaneously renders the buffer onto the surface.
             decoder.releaseOutputBuffer(bufId, hasToRender)
@@ -231,6 +227,8 @@ class PlaybackSession(
 
         fun cancelBufferRelease() {
             removeMessages(WHAT_RELEASE_BUFFER)
+//            val msg=queuedReleaseProperties.map{ "${it.outputBufferId}(${it.presentationTimeUs/1000})"  }
+//            Log.d(TAG, "buffers to be released=$msg")
             queuedReleaseProperties.clear()
         }
 
@@ -247,7 +245,7 @@ class PlaybackSession(
     private val decoderCallback: MediaCodec.Callback = object : MediaCodec.Callback() {
         override fun onInputBufferAvailable(decoder: MediaCodec, bufferId: Int) {
             val bufIdWithTimestamp = "inputBuffer$bufferId (${extractor.sampleTime / 1000})"
-            Log.v(TAG, "$bufIdWithTimestamp is available")
+            Log.v(TAG, "$bufIdWithTimestamp available")
             val inputBuffer = decoder.getInputBuffer(bufferId)!!
             val sampleSize = extractor.readSampleData(inputBuffer, 0)
             if (sampleSize == -1) {
@@ -268,18 +266,18 @@ class PlaybackSession(
                 "outputBuffer$bufferId (${bufferInfo.presentationTimeUs / 1000})"
             if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                 Log.i(TAG, "$bufIdWithTimestamp BUFFER_FLAG_END_OF_STREAM")
-            } else if (hasOutdatedOutputBuffer) {
-                if (bufferInfo.presentationTimeUs == startingKeyframeTimestampUs) {
-                    Log.i(TAG, "$bufIdWithTimestamp has the target key frame of seek")
-                    hasOutdatedOutputBuffer = false
+            } else if (!hasFirstKeyframeProcessed) {
+                if (bufferInfo.presentationTimeUs == firstKeyframeTimestampUs) {
+                    Log.v(TAG, "$bufIdWithTimestamp has the first keyframe")
+                    hasFirstKeyframeProcessed = true
                     handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
                 } else {
-                    Log.i(TAG, "$bufIdWithTimestamp is outdated, skipped")
+                    Log.v(TAG, "$bufIdWithTimestamp is outdated, skipped")
                 }
             } else if (!isCaughtUp && bufferInfo.presentationTimeUs >= expectedPositionUs) {
                 // when perform seek with very small playbackSpeed, we want to render once no matter
                 // how long the rendering timeout is.
-                Log.i(TAG, "$bufIdWithTimestamp playback is caught up")
+                Log.v(TAG, "$bufIdWithTimestamp playback caught up")
                 isCaughtUp = true
                 handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
             } else {
@@ -290,11 +288,6 @@ class PlaybackSession(
         override fun onOutputFormatChanged(decoder: MediaCodec, format: MediaFormat) {
             Log.i(TAG, "onOutputFormatChanged, format: $format")
             hasFormatChanged = true
-            pendingSeekRequest?.also {
-                Log.i(TAG, "posting pending seek request")
-                handler.post(it)
-                pendingSeekRequest = null
-            }
         }
 
         override fun onError(decoder: MediaCodec, exception: MediaCodec.CodecException) {
@@ -307,6 +300,7 @@ class PlaybackSession(
         setDataSource(context, videoUri, null)
     }
 
+    lateinit var format: MediaFormat
     private val decoder = extractor.let {
         Log.i(TAG, "creating decoder")
         val (trackId, format, mime) =
@@ -317,6 +311,7 @@ class PlaybackSession(
             }.find { (_, _, mime) ->
                 mime.startsWith("video/")
             }!!
+        this.format = format
         // Configure extractor with video track.
         extractor.selectTrack(trackId)
         MediaCodec.createDecoderByType(mime).apply {
@@ -329,9 +324,11 @@ class PlaybackSession(
      * Free up all resources. [PlaybackSession] instance cannot be used no more.
      */
     fun close() {
+        // TODO: there can be outlived oOAB 
         handler.post {
             handler.cancelBufferRelease()
             Log.i(TAG, "releasing extractor and decoder")
+            decoder.stop()
             decoder.release()
             extractor.release()
         }
@@ -365,30 +362,30 @@ class PlaybackSession(
      *  - [MediaExtractor.SEEK_TO_PREVIOUS_SYNC] (default)
      */
     fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
-        val seekRequest = Runnable {
+        Log.v(TAG, "posting seek request")
+        handler.post {
             val positionUs = (positionMs * 1000).coerceIn(0, durationUs)
-            Log.i(TAG, "Seek to ${positionMs}ms (actual: ${positionUs / 1000}ms)")
+            val seekMode = if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
+            Log.i(TAG, "seek to ${positionMs}ms (actual: ${positionUs / 1000}ms)")
             startingPositionUs = positionUs
             startingErtNs = ertNs()
             lastAcceptedRenderingTimeUs = 0L
             isCaughtUp = false
-            extractor.seekTo(
-                positionUs,
-                if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
-            )
-            decoder.flush()
-            decoder.start()
+//            handler.looper.dump({ s -> Log.d(TAG, s) }, ">")
             handler.cancelBufferRelease()
+            extractor.seekTo(positionUs, seekMode)
+            if (hasFormatChanged) {
+                decoder.flush()
+            } else {
+                Log.i(TAG, "has not received format change, stop-configure-start decoder")
+                decoder.stop()
+                decoder.setCallback(decoderCallback)
+                decoder.configure(format, surface, null, 0)
+            }
+            decoder.start()
             // prevents outlived onOutputBufferAvailable from sending invalid buffer release messages.
-            hasOutdatedOutputBuffer = true
-            startingKeyframeTimestampUs = extractor.sampleTime
-        }
-        // when we flush the codec before the output format change is received,
-        // we have to resubmit the codec-specific-data.
-        if (!hasFormatChanged) {
-            pendingSeekRequest = seekRequest
-        } else {
-            handler.post(seekRequest)
+            hasFirstKeyframeProcessed = false
+            firstKeyframeTimestampUs = extractor.sampleTime
         }
     }
 
@@ -410,9 +407,13 @@ class PlaybackSession(
         sampleTimeUs
     }
 
+    /** Must be updated [extractor].seekTo() is called. */
+    private var firstKeyframeTimestampUs = extractor.sampleTime
+
     init {
         startingErtNs = ertNs()
         decoder.start()
+        Log.i(TAG, "playback session created")
     }
 
     companion object {

@@ -80,9 +80,10 @@ class VideoPlayerTest {
     @Test
     fun justPlay() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
+        val timeout = 3000L
         player.play(videos[0])
-        Thread.sleep(2000)
-        assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
+        Thread.sleep(timeout)
+        assertEquals(timeout.toDouble(), player.currentPositionMs.toDouble(), delta)
     }
 
     @Test
@@ -100,28 +101,39 @@ class VideoPlayerTest {
     }
 
     @Test
-    fun seekImmediately() = withPlayerAndVideos { player, videos, _ ->
-        // TODO: random crash (segmentation fault)
-        val delta = 100.0
+    fun seekAsSoonAsStart() = withPlayerAndVideos { player, videos, _ ->
+        // decoder.flush random crash
+        repeat(7) {
+            player.play(videos[0])
+            player.seekToThenSleep(3000 + 700 * it.toLong(), 1000)
+        }
+    }
+
+    @Test
+    fun seekOnSpeedChange() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 200.0
         player.play(videos[0])
-        player.seekToThenSleep(9000, 1000)
-        assertEquals(
-            "seek immediately after start playing",
-            10000.0, player.currentPositionMs.toDouble(), delta
-        )
-        player.seekTo(9500)
-        player.playbackSpeed = 0.5
         Thread.sleep(1000)
-        assertEquals(
-            "seek then change speed",
-            10_000.0, player.currentPositionMs.toDouble(), delta
-        )
-        player.playbackSpeed = 1.5
-        player.seekToThenSleep(18500, 1000)
-        assertEquals(
-            "seek immediately after change speed",
-            20000.0, player.currentPositionMs.toDouble(), delta
-        )
+        repeat(7) { lap ->
+            val seedMs = 700L
+            var offsetMs = 3000
+            fun destPosition() = offsetMs + seedMs * lap
+            fun expected() = destPosition() + 1000 * player.playbackSpeed
+            player.seekTo(destPosition())
+            player.playbackSpeed = 0.5
+            Thread.sleep(1000)
+            assertEquals(
+                "seek then change speed",
+                expected(), player.currentPositionMs.toDouble(), delta
+            )
+            offsetMs = 6000
+            player.playbackSpeed = 1.5
+            player.seekToThenSleep(destPosition(), 1000)
+            assertEquals(
+                "seek immediately after change speed",
+                expected(), player.currentPositionMs.toDouble(), delta
+            )
+        }
     }
 
     @Test
@@ -134,33 +146,31 @@ class VideoPlayerTest {
         player.playbackSpeed = 0.0
         player.seekTo(0, 1000)
         // TODO: fails because extractor.seekTo() cannot seek to 0ms
-        assertEquals("seek with pause", 0.0, player.currentPositionMs.toDouble(), delta)
+        assertEquals(
+            "seek with pause (known issue: extractor.seekTo() cannot seek to 0ms)",
+            0.0, player.currentPositionMs.toDouble(), delta
+        )
     }
 
     @Test
     fun changeVideoWhilePlaying() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
-        player.play(videos[0])
-        Thread.sleep(2000)
-        assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
-        assertEquals(player.videoUri, videos[0])
-        Thread.sleep(2000)
-        player.play(videos[1])
-        Thread.sleep(2000)
-        assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
-        assertEquals(player.videoUri, videos[1])
+        (0..3).forEach {
+            player.play(videos[it])
+            Thread.sleep(2000)
+            assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
+            assertEquals(player.videoUri, videos[it])
+        }
     }
 
     @Test
     fun playToTheEndThenPause() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
         player.play(videos[0])
-        player.playbackSpeed = 0.3
         Thread.sleep(1000)
-        repeat(2) {
+        repeat(3) {
             // Seek to the right before the end, then check player's state.
-            player.seekTo(player.durationMs)
-            Thread.sleep(2000)
+            player.seekToThenSleep(player.durationMs, 2000)
             assertEquals(player.durationMs.toDouble(), player.currentPositionMs.toDouble(), delta)
         }
     }
