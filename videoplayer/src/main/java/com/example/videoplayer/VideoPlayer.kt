@@ -16,7 +16,7 @@ import java.util.concurrent.SynchronousQueue
 import kotlin.math.absoluteValue
 
 /**
- * Simple video player powered by MediaCodec's async mode.
+ * Simple video player with MediaCodec's async mode.
  * When an object is no longer being used, call [close] to free up resources.
  * ```
  * Player(context, surface).also {
@@ -42,33 +42,48 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         set(value) {
             session!!.playbackSpeed = value
         }
+    var lastNonZeroPlaybackSpeed = 1.0
     private var session: PlaybackSession? = null
     private val playbackThread = HandlerThread("playbackThread").also { it.start() }
     private val playbackThreadHandler = Handler(playbackThread.looper)
 
-    fun playWhenReady(videoUri: Uri) {
+    /**
+     * @param async if `false` (default) it blocks current thread until playback starts.
+     */
+    fun play(videoUri: Uri, startingPositionMs: Long = 0, async: Boolean = false) {
         session?.also { it.close() }
         playbackThreadHandler.post {
-            session = PlaybackSession(videoUri, context, surface, playbackThread.looper)
+            session = PlaybackSession(
+                videoUri,
+                startingPositionMs,
+                context,
+                surface,
+                playbackThread.looper
+            )
         }
-    }
-
-    // TODO: optional starting position
-    /** Blocks until playback starts. */
-    fun play(videoUri: Uri) {
-        playWhenReady(videoUri)
+        if (async) return
+        // block caller thread until above posting is consumed
         val queue = SynchronousQueue<Unit>()
         playbackThreadHandler.post { queue.put(Unit) }
         queue.take()
     }
 
     fun close() {
-        session!!.close()
+        session?.close()
+        // TODO: quit safely to make sure that the decoder stopped
         playbackThread.quit()
     }
 
-    fun isPlaying(): Boolean {
-        return session != null
+    val isPlaying: Boolean
+        get() = session != null && playbackSpeed != 0.0
+
+    fun togglePause() {
+        if (playbackSpeed != 0.0) {
+            lastNonZeroPlaybackSpeed = playbackSpeed
+            playbackSpeed = 0.0
+        } else {
+            playbackSpeed = lastNonZeroPlaybackSpeed
+        }
     }
 
     fun seekTo(positionMs: Long, mode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
@@ -81,6 +96,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
  */
 class PlaybackSession(
     val videoUri: Uri,
+    startingPositionMs: Long = 0,
     private val context: Context,
     private val surface: Surface,
     looper: Looper
@@ -333,6 +349,7 @@ class PlaybackSession(
      * Free up all resources. [PlaybackSession] instance cannot be used no more.
      */
     fun close() {
+        // TODO: postAtFront
         handler.post {
             handler.cancelBufferRelease()
             Log.i(TAG, "releasing extractor and decoder")
@@ -373,7 +390,6 @@ class PlaybackSession(
         // while delaying execution of seek, any post of releaseOutputBuffer will be suspended
         // by our handler; we can safely call flush() without outliving onOutputBufferAvailable (cause of crash)
         pendingSeekRequest = Runnable {
-            val startNs = System.nanoTime()
             val positionUs = (positionMs * 1000).coerceIn(0, durationUs)
             Log.i(TAG, "seek to ${positionMs}ms (actual: ${positionUs / 1000}ms)")
             startingPositionUs = positionUs
@@ -381,6 +397,7 @@ class PlaybackSession(
             lastAcceptedRenderingTimeUs = 0L
             isCaughtUp = false
             hasFirstKeyframeProcessed = false
+            handler.cancelBufferRelease()
 //            handler.looper.dump({ s -> Log.d(TAG, s) }, ">")
             val seekMode = if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
             extractor.seekTo(positionUs, seekMode)
@@ -388,7 +405,6 @@ class PlaybackSession(
             decoder.flush()
             decoder.start()
             pendingSeekRequest = null
-            Log.d(TAG, "seek took ${(System.nanoTime() - startNs) / 1e6}ms")
         }
         // stalls decoder by suspending buffer release
         handler.updateBufferRelease("seekTo")
@@ -413,8 +429,6 @@ class PlaybackSession(
             sampleTimeUs = extractor.sampleTime
             extractor.advance()
         }
-        // TODO: always seeks to around 1s (second keyframe?), not 0s
-        extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
         sampleTimeUs
     }
 
@@ -428,10 +442,14 @@ class PlaybackSession(
     }
 
     init {
+        startingPositionUs = (startingPositionMs * 1000).coerceIn(0, durationUs)
+        currentPositionMs = startingPositionUs / 1000
+        // TODO: cannot seek to 0s (always seeks to around 1s)
+        extractor.seekTo(startingPositionUs, MediaExtractor.SEEK_TO_PREVIOUS_SYNC)
         firstKeyframeTimestampUs = extractor.sampleTime
         startingErtNs = ertNs()
         decoder.start()
-        Log.i(TAG, "playback session created")
+        Log.i(TAG, "start")
     }
 
     companion object {

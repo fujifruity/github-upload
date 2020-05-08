@@ -102,6 +102,17 @@ class VideoPlayerTest {
     }
 
     @Test
+    fun startFromMiddlePosition() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 100.0
+        repeat(3) { n ->
+            val startingPositionMs = 9000L + 600 * n
+            player.play(videos[0], startingPositionMs)
+            Thread.sleep(1000)
+            assertEquals(startingPositionMs + 1000.0, player.currentPositionMs.toDouble(), delta)
+        }
+    }
+
+    @Test
     fun seekOnStart() = withPlayerAndVideos { player, videos, _ ->
         val delta = 200.0
         repeat(7) {
