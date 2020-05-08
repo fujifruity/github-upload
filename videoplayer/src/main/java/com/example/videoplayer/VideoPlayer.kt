@@ -17,11 +17,9 @@ import kotlin.math.absoluteValue
 
 /**
  * Simple video player powered by MediaCodec's async mode.
- * When an object is no longer being used, call [close] as soon as possible to release the resources being used.
+ * When an object is no longer being used, call [close] to free up resources.
  * ```
- * val holder: SurfaceHolder = ...
- * Player(applicationContext, holder.surface).also {
- *     val videoUrl: String = ...
+ * Player(context, surface).also {
  *     it.play(videoUrl)
  *     Thread.sleep(3000)
  *     it.playbackSpeed = 2.0
@@ -55,6 +53,7 @@ class VideoPlayer(private val context: Context, private val surface: Surface) {
         }
     }
 
+    // TODO: optional starting position
     /** Blocks until playback starts. */
     fun play(videoUri: Uri) {
         playWhenReady(videoUri)
@@ -93,14 +92,16 @@ class PlaybackSession(
     /** "renderingTime" is defined in [calculateTimeoutMs]. */
     private var lastAcceptedRenderingTimeUs = 0L
     private var intermissionUs = 30_000L
-    private var hasFirstKeyframeProcessed = false
     private var hasFormatChanged = false
+    private var hasFirstKeyframeProcessed = false
+    private var firstKeyframeTimestampUs = 0L
     private var isCaughtUp = true
+    private var pendingSeekRequest: Runnable? = null
 
     /** Elapsed real-time since system boot. */
     private fun ertNs() = System.nanoTime()
 
-    /** The last elapsed real-time at which [playbackSpeed] is changed or start playback. */
+    /** The last elapsed real-time at which [playbackSpeed] is changed, call [seekTo], or instantiate. */
     private var startingErtNs = 0L
 
     /** The last position at which [playbackSpeed] is changed or start playback. */
@@ -124,8 +125,10 @@ class PlaybackSession(
          * - who removes an element: [handler]'s onMessage callback
          * - who removes all elements: [seekTo] and [playbackSpeed]'s setter
          */
-        private val queuedReleaseProperties = mutableListOf<ReleaseProperty>()
+        val queuedReleaseProperties = mutableListOf<ReleaseProperty>()
         private val WHAT_RELEASE_BUFFER = 1001
+        private val ONE_HOUR_US: Long = 3600_000_000
+        private val ONE_HOUR_MS: Long = 3600_000
 
         inner class ReleaseProperty(
             val outputBufferId: Int,
@@ -136,6 +139,8 @@ class PlaybackSession(
             operator fun component1() = outputBufferId
             operator fun component2() = presentationTimeUs
             operator fun component3() = hasToRender
+            override fun toString() =
+                "ReleaseProperty($outputBufferId, ${presentationTimeUs / 1000}ms, $hasToRender)"
         }
 
         override fun handleMessage(msg: Message) {
@@ -164,21 +169,25 @@ class PlaybackSession(
             )
         }
 
-        fun render(outputBufferId: Int, presentationTimeUs: Long, tag: String) {
-            sendReleaseMessage(
-                ReleaseProperty(outputBufferId, presentationTimeUs, true),
-                0,
-                tag
-            )
-        }
-
         /** Schedules releasing output buffer after calculating timeout. */
         fun postBufferRelease(outputBufferId: Int, presentationTimeUs: Long, tag: String) {
             val (timeoutMs, hasToRender) = run {
+                if (pendingSeekRequest != null) {
+                    // prevents another oOBA callback from outliving flush()
+                    Log.v(TAG, "seek request exists; suspend buffer release")
+                    return@run ONE_HOUR_MS to false
+                }
                 val expectedPositionUs = expectedPositionUs
+                if (!isCaughtUp && presentationTimeUs >= expectedPositionUs) {
+                    // when perform seek with very small playbackSpeed, we want to immediately
+                    // render next frame no matter how long the rendering timeout is.
+                    Log.v(TAG, "playback caught up")
+                    isCaughtUp = true
+                    return@run 0L to true
+                }
                 val timeoutCandidateUs =
                     ((presentationTimeUs - expectedPositionUs) / playbackSpeed).toLong()
-                        .coerceAtMost(3600_000_000)
+                        .coerceAtMost(ONE_HOUR_US)
                 if (timeoutCandidateUs < 0) return@run 0L to false
                 // tricky definition: position + real time
                 val renderingTimeUs = expectedPositionUs + timeoutCandidateUs
@@ -232,14 +241,18 @@ class PlaybackSession(
             queuedReleaseProperties.clear()
         }
 
-        fun updateBufferRelease() {
+        fun updateBufferRelease(tag: String) {
             val props = queuedReleaseProperties.toList()
             cancelBufferRelease()
             props.forEach { (bufId, presentationTimeUs, _) ->
-                postBufferRelease(bufId, presentationTimeUs, "spd setter")
+                postBufferRelease(bufId, presentationTimeUs, tag)
             }
         }
 
+        fun postPendingSeekRequest() {
+            // TODO:  short delay causes crash
+            postDelayed(pendingSeekRequest!!, 20)
+        }
     }
 
     private val decoderCallback: MediaCodec.Callback = object : MediaCodec.Callback() {
@@ -262,32 +275,30 @@ class PlaybackSession(
             bufferId: Int,
             bufferInfo: MediaCodec.BufferInfo
         ) {
+            val timestampUs = bufferInfo.presentationTimeUs
             val bufIdWithTimestamp =
-                "outputBuffer$bufferId (${bufferInfo.presentationTimeUs / 1000})"
+                "outputBuffer$bufferId (${timestampUs / 1000})"
             if (bufferInfo.flags and MediaCodec.BUFFER_FLAG_END_OF_STREAM != 0) {
                 Log.i(TAG, "$bufIdWithTimestamp BUFFER_FLAG_END_OF_STREAM")
             } else if (!hasFirstKeyframeProcessed) {
-                if (bufferInfo.presentationTimeUs == firstKeyframeTimestampUs) {
+                if (timestampUs == firstKeyframeTimestampUs) {
                     Log.v(TAG, "$bufIdWithTimestamp has the first keyframe")
                     hasFirstKeyframeProcessed = true
-                    handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
+                    handler.postBufferRelease(bufferId, timestampUs, "oOBA")
                 } else {
-                    Log.v(TAG, "$bufIdWithTimestamp is outdated, skipped")
+                    Log.v(TAG, "$bufIdWithTimestamp is not the first keyframe, skipped")
                 }
-            } else if (!isCaughtUp && bufferInfo.presentationTimeUs >= expectedPositionUs) {
-                // when perform seek with very small playbackSpeed, we want to render once no matter
-                // how long the rendering timeout is.
-                Log.v(TAG, "$bufIdWithTimestamp playback caught up")
-                isCaughtUp = true
-                handler.render(bufferId, bufferInfo.presentationTimeUs, "oOBA")
             } else {
-                handler.postBufferRelease(bufferId, bufferInfo.presentationTimeUs, "oOBA")
+                handler.postBufferRelease(bufferId, timestampUs, "oOBA")
             }
         }
 
         override fun onOutputFormatChanged(decoder: MediaCodec, format: MediaFormat) {
             Log.i(TAG, "onOutputFormatChanged, format: $format")
             hasFormatChanged = true
+            pendingSeekRequest?.also {
+                handler.postPendingSeekRequest()
+            }
         }
 
         override fun onError(decoder: MediaCodec, exception: MediaCodec.CodecException) {
@@ -296,12 +307,11 @@ class PlaybackSession(
     }
 
     private val extractor = MediaExtractor().apply {
-        Log.i(TAG, "creating extractor")
+        Log.i(TAG, "creating extractor on $videoUri")
         setDataSource(context, videoUri, null)
     }
 
-    lateinit var format: MediaFormat
-    private val decoder = extractor.let {
+    private val decoder: MediaCodec = run {
         Log.i(TAG, "creating decoder")
         val (trackId, format, mime) =
             0.until(extractor.trackCount).map { trackId ->
@@ -311,7 +321,6 @@ class PlaybackSession(
             }.find { (_, _, mime) ->
                 mime.startsWith("video/")
             }!!
-        this.format = format
         // Configure extractor with video track.
         extractor.selectTrack(trackId)
         MediaCodec.createDecoderByType(mime).apply {
@@ -324,7 +333,6 @@ class PlaybackSession(
      * Free up all resources. [PlaybackSession] instance cannot be used no more.
      */
     fun close() {
-        // TODO: there can be outlived oOAB 
         handler.post {
             handler.cancelBufferRelease()
             Log.i(TAG, "releasing extractor and decoder")
@@ -342,7 +350,7 @@ class PlaybackSession(
         set(value) {
             if (value == playbackSpeed) return
             handler.post {
-                Log.i(TAG, "Setting playback speed x$value")
+                Log.i(TAG, "set playback speed x$value")
                 // used to calculate buffer release timeout
                 startingPositionUs = expectedPositionUs
                 startingErtNs = ertNs()
@@ -351,7 +359,7 @@ class PlaybackSession(
                 intermissionUs = (30_000 * playbackSpeed).toLong()
                 Log.v(TAG, "intermissionMs=${intermissionUs / 1000}")
                 // scheduled buffer releases are invalid now, reschedule.
-                handler.updateBufferRelease()
+                handler.updateBufferRelease("spd setter")
             }
         }
 
@@ -362,30 +370,33 @@ class PlaybackSession(
      *  - [MediaExtractor.SEEK_TO_PREVIOUS_SYNC] (default)
      */
     fun seekTo(positionMs: Long, seekMode: Int = MediaExtractor.SEEK_TO_PREVIOUS_SYNC) {
-        Log.v(TAG, "posting seek request")
-        handler.post {
+        // while delaying execution of seek, any post of releaseOutputBuffer will be suspended
+        // by our handler; we can safely call flush() without outliving onOutputBufferAvailable (cause of crash)
+        pendingSeekRequest = Runnable {
+            val startNs = System.nanoTime()
             val positionUs = (positionMs * 1000).coerceIn(0, durationUs)
-            val seekMode = if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
             Log.i(TAG, "seek to ${positionMs}ms (actual: ${positionUs / 1000}ms)")
             startingPositionUs = positionUs
             startingErtNs = ertNs()
             lastAcceptedRenderingTimeUs = 0L
             isCaughtUp = false
-//            handler.looper.dump({ s -> Log.d(TAG, s) }, ">")
-            handler.cancelBufferRelease()
-            extractor.seekTo(positionUs, seekMode)
-            if (hasFormatChanged) {
-                decoder.flush()
-            } else {
-                Log.i(TAG, "has not received format change, stop-configure-start decoder")
-                decoder.stop()
-                decoder.setCallback(decoderCallback)
-                decoder.configure(format, surface, null, 0)
-            }
-            decoder.start()
-            // prevents outlived onOutputBufferAvailable from sending invalid buffer release messages.
             hasFirstKeyframeProcessed = false
+//            handler.looper.dump({ s -> Log.d(TAG, s) }, ">")
+            val seekMode = if (positionUs == 0L) MediaExtractor.SEEK_TO_CLOSEST_SYNC else seekMode
+            extractor.seekTo(positionUs, seekMode)
             firstKeyframeTimestampUs = extractor.sampleTime
+            decoder.flush()
+            decoder.start()
+            pendingSeekRequest = null
+            Log.d(TAG, "seek took ${(System.nanoTime() - startNs) / 1e6}ms")
+        }
+        // stalls decoder by suspending buffer release
+        handler.updateBufferRelease("seekTo")
+        if (hasFormatChanged) {
+            Log.v(TAG, "post seek request")
+            handler.postPendingSeekRequest()
+        } else {
+            Log.v(TAG, "decoder has not recieved format change; suspend seek request")
         }
     }
 
@@ -407,10 +418,17 @@ class PlaybackSession(
         sampleTimeUs
     }
 
-    /** Must be updated [extractor].seekTo() is called. */
-    private var firstKeyframeTimestampUs = extractor.sampleTime
+    private fun retrieveDurationUs(): Long {
+        val retriever = MediaMetadataRetriever()
+        retriever.setDataSource(context, videoUri)
+        val durationMsStr =
+            retriever.extractMetadata(MediaMetadataRetriever.METADATA_KEY_DURATION)!!
+        retriever.release()
+        return durationMsStr.toLong() * 1000
+    }
 
     init {
+        firstKeyframeTimestampUs = extractor.sampleTime
         startingErtNs = ertNs()
         decoder.start()
         Log.i(TAG, "playback session created")

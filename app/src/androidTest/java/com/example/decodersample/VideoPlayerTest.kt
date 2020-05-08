@@ -5,6 +5,7 @@ import android.content.Context
 import android.media.MediaExtractor
 import android.net.Uri
 import android.provider.MediaStore
+import android.util.Log
 import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.example.videoplayer.VideoPlayer
@@ -101,11 +102,21 @@ class VideoPlayerTest {
     }
 
     @Test
-    fun seekAsSoonAsStart() = withPlayerAndVideos { player, videos, _ ->
-        // decoder.flush random crash
+    fun seekOnStart() = withPlayerAndVideos { player, videos, _ ->
+        val delta = 200.0
         repeat(7) {
+            Log.i(TAG, "lap #$it")
             player.play(videos[0])
-            player.seekToThenSleep(3000 + 700 * it.toLong(), 1000)
+            Thread.sleep(7L * it)
+//            Thread.sleep(500+70L*it)
+//            Thread.sleep(1000+7L*it)
+            val destinationMs = 3000 + 300 * it.toLong()
+            player.seekToThenSleep(destinationMs, 1000)
+            assertEquals(
+                destinationMs.toDouble() + 1000,
+                player.currentPositionMs.toDouble(),
+                delta
+            )
         }
     }
 
@@ -123,7 +134,7 @@ class VideoPlayerTest {
             player.playbackSpeed = 0.5
             Thread.sleep(1000)
             assertEquals(
-                "seek then change speed",
+                "change speed immediately after seek",
                 expected(), player.currentPositionMs.toDouble(), delta
             )
             offsetMs = 6000
@@ -155,11 +166,14 @@ class VideoPlayerTest {
     @Test
     fun changeVideoWhilePlaying() = withPlayerAndVideos { player, videos, _ ->
         val delta = 100.0
-        (0..3).forEach {
-            player.play(videos[it])
-            Thread.sleep(2000)
-            assertEquals(2000.0, player.currentPositionMs.toDouble(), delta)
-            assertEquals(player.videoUri, videos[it])
+        // play 3 different videos twice with 2 different periods.
+        0.until(6).forEach { n ->
+            val videoIdx = n % 3
+            player.play(videos[videoIdx])
+            val timeout = 2000L + 100 * n
+            Thread.sleep(timeout)
+            assertEquals(timeout.toDouble(), player.currentPositionMs.toDouble(), delta)
+            assertEquals(player.videoUri, videos[videoIdx])
         }
     }
 
