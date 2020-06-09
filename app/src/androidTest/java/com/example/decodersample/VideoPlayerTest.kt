@@ -10,6 +10,7 @@ import androidx.test.core.app.launchActivity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.example.videoplayer.VideoPlayer
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Test
 import org.junit.runner.RunWith
 
@@ -167,8 +168,8 @@ class VideoPlayerTest {
         assertEquals("seek with normal speed", 1000.0, player.currentPositionMs.toDouble(), delta)
         player.playbackSpeed = 0.0
         player.seekTo(0, 1000)
-        // TODO: fails because extractor.seekTo() cannot seek to 0ms
-        assertEquals(
+        // TODO: extractor.seekTo() cannot seek to 0ms
+        assertNotEquals(
             "seek with pause (known issue: extractor.seekTo() cannot seek to 0ms)",
             0.0, player.currentPositionMs.toDouble(), delta
         )

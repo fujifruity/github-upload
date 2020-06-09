@@ -105,7 +105,7 @@ class PlaybackSession(
     var currentPositionMs: Long = 0L
         private set
 
-    /** "renderingTime" is defined in [calculateTimeoutMs]. */
+    /** "renderingTime" is defined in [handler]'s postBufferRelease method. */
     private var lastAcceptedRenderingTimeUs = 0L
     private var intermissionUs = 30_000L
     private var hasFormatChanged = false
@@ -322,9 +322,11 @@ class PlaybackSession(
         }
     }
 
+    private val pfd = context.contentResolver.openFileDescriptor(videoUri, "r")!!
+
     private val extractor = MediaExtractor().apply {
         Log.i(TAG, "creating extractor on $videoUri")
-        setDataSource(context, videoUri, null)
+        setDataSource(pfd.fileDescriptor)
     }
 
     private val decoder: MediaCodec = run {
@@ -356,6 +358,7 @@ class PlaybackSession(
             decoder.stop()
             decoder.release()
             extractor.release()
+            pfd.close()
         }
     }
 
